@@ -42,6 +42,7 @@ _KIND_LABELS: dict[str, str] = {
     "hipaa_bulk_export": "bulk record export",
     "hipaa_off_hours": "off-hours access",
     "hipaa_region_mismatch": "cross-region access",
+    "auth_suspicious_login": "suspicious login",
 }
 
 _CloudWatchItem = tuple[Literal["cloudwatch"], Alert]
@@ -113,6 +114,9 @@ class AwsNotifier:
         self.mock_log_path = mock_log_path
         self.max_attempts = max_attempts
         self.base_backoff = base_backoff
+        # Applied to everything leaving the process (set by the pipeline to the
+        # configured redactor); identity by default.
+        self.redact: Callable[[Any], Any] = lambda value: value
 
         self._queue: "asyncio.Queue[_QueueItem]" = asyncio.Queue()  # unbounded: never blocks the producer
         self._worker_task: Optional[asyncio.Task] = None
@@ -266,10 +270,10 @@ class AwsNotifier:
         if self.mode == "mock":
             self._append_mock(
                 {"aws_service": "cloudwatch_logs", "log_group": self.log_group,
-                 "log_stream": self._stream_for(alert.ts), "alert": alert.model_dump(mode="json")}
+                 "log_stream": self._stream_for(alert.ts), "alert": self.redact(alert.model_dump(mode="json"))}
             )
             return
-        await self._put_log_event(alert.ts, json.dumps(alert.model_dump(mode="json")))
+        await self._put_log_event(alert.ts, json.dumps(self.redact(alert.model_dump(mode="json"))))
 
     def _stream_for(self, ts: datetime) -> str:
         return self.log_stream or ts.strftime("%Y-%m-%d")
@@ -299,7 +303,7 @@ class AwsNotifier:
         target = incident.service or incident.user_id or "unknown"
         label = _KIND_LABELS.get(incident.kind, incident.kind)
         subject = f"[MedGuard {incident.peak_severity}] {target}: {label}"[:100]
-        body = f"{explanation}\n\nIncident ID: {incident.id}"
+        body = self.redact(f"{explanation}\n\nIncident ID: {incident.id}")
         await self._publish(subject, body)
 
     async def _publish(self, subject: str, body: str) -> None:

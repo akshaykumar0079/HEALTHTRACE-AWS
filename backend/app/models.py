@@ -11,6 +11,7 @@ Service = Literal["claims", "prior_auth", "eligibility", "pharmacy", "batch"]
 Level = Literal["INFO", "WARN", "ERROR"]
 Priority = Literal["urgent", "routine"]
 AuditAction = Literal["VIEW_RECORD", "EDIT_RECORD", "EXPORT_RECORDS", "SEARCH"]
+AuthOutcome = Literal["success", "failure"]
 
 # Synthetic patient IDs only, e.g. "P-000123" (SPEC.md section 1: hard rules).
 PATIENT_ID_PATTERN = r"^P-\d{6}$"
@@ -53,6 +54,24 @@ class AuditEvent(BaseModel):
         return self.patient_region != self.user_region
 
 
+class AuthEvent(BaseModel):
+    """One JSON line from data/logs/auth.log: a login attempt. Synthetic only;
+    ``source_ip`` uses the documentation range 192.0.2.0/24 (RFC 5737)."""
+
+    ts: datetime
+    type: Literal["auth"] = "auth"
+    user_id: str
+    outcome: AuthOutcome
+    method: str = "password"
+    source_region: str
+    user_region: str
+    source_ip: Optional[str] = None
+
+    @property
+    def is_unfamiliar_region(self) -> bool:
+        return self.source_region != self.user_region
+
+
 class WindowMetrics(BaseModel):
     """One 60s-window snapshot for one service, emitted every 5s of event time
     (SPEC.md section 6.3)."""
@@ -79,6 +98,7 @@ AnomalyKind = Literal[
     "hipaa_off_hours",
     "hipaa_region_mismatch",
     "hipaa_bulk_export",
+    "auth_suspicious_login",
 ]
 
 
@@ -141,11 +161,19 @@ class Incident(BaseModel):
     # Highest real detector score among attached alerts; None for rule-based
     # (HIPAA) detections, which have no continuous score. Never fabricated.
     peak_score: Optional[float] = None
+    # Latest alert's real score (None for rule-based detections) and the
+    # direction of recent risk. Trend is derived from stored alerts only.
+    latest_score: Optional[float] = None
+    risk_trend: Literal["rising", "falling", "stable", "unknown"] = "unknown"
+    # How many times a resolved incident was reopened by a recurrence (see
+    # docs/incident-grouping.md) and how many evidence records are stored.
+    reopen_count: int = 0
+    evidence_count: int = 0
 
 
 IncidentEventType = Literal[
     "opened", "alert_attached", "escalated", "acknowledged", "investigating", "resolved", "auto_resolved",
-    "muted", "pinned", "unpinned",
+    "muted", "pinned", "unpinned", "reopened",
 ]
 
 

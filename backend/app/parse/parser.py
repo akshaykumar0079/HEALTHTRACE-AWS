@@ -12,11 +12,11 @@ from typing import Optional, Union
 
 from pydantic import ValidationError
 
-from app.models import AppEvent, AuditEvent
+from app.models import AppEvent, AuditEvent, AuthEvent
 
 logger = logging.getLogger(__name__)
 
-ParsedEvent = Union[AppEvent, AuditEvent]
+ParsedEvent = Union[AppEvent, AuditEvent, AuthEvent]
 
 
 class Parser:
@@ -41,6 +41,8 @@ class Parser:
                 return AppEvent.model_validate(data)
             if event_type == "audit":
                 return AuditEvent.model_validate(data)
+            if event_type == "auth":
+                return AuthEvent.model_validate(data)
         except ValidationError:
             self.malformed_lines += 1
             logger.debug("malformed line (schema): %r", line[:200])

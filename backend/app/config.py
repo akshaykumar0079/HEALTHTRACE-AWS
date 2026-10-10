@@ -82,6 +82,19 @@ class IncidentConfig(BaseModel):
     cooldown_minutes: float
     service_auto_resolve_windows: int
     hipaa_auto_resolve_minutes: float
+    # A recurrence of a resolved incident's fingerprint within this many
+    # minutes (of event time) reopens that incident instead of creating a new
+    # one. 0 disables reopening. See docs/incident-grouping.md.
+    reopen_window_minutes: float = 0.0
+
+
+class AuthConfig(BaseModel):
+    """Failed-logins-then-success rule (kind ``auth_suspicious_login``)."""
+
+    failure_threshold: int = 5          # failures before a success that make it suspicious
+    window_minutes: float = 10          # failures older than this are forgotten
+    high_failure_multiple: int = 2      # >= threshold * this many failures raises severity
+    realert_seconds: float = 60
 
 
 class WindowConfig(BaseModel):
@@ -98,6 +111,7 @@ class AppConfig(BaseModel):
     hipaa: HipaaConfig
     incident: IncidentConfig
     window: WindowConfig
+    auth: AuthConfig = AuthConfig()
 
 
 @lru_cache
@@ -170,6 +184,27 @@ class Settings(BaseSettings):
     # Persist at most one window-metric row per service per N seconds (0 = every
     # window). Keeps a hosted serverless Postgres from being kept awake 24/7.
     metrics_persist_interval_seconds: float = 0.0
+    # -- privacy / retention / roles (docs/privacy-and-retention.md) -----------
+    redaction_enabled: bool = True
+    redact_extra_fields: str = ""     # comma-separated extra keys to always redact
+    redact_extra_patterns: str = ""   # comma-separated regexes replaced by [REDACTED]
+    # Retention in days; 0 keeps forever. Unresolved incidents are never deleted.
+    retention_metrics_hours: int = 24
+    retention_evidence_days: int = 30
+    retention_alerts_days: int = 90
+    retention_resolved_incidents_days: int = 90
+    retention_notification_attempts_days: int = 30
+    retention_simulation_runs_days: int = 30
+    retention_audit_days: int = 365
+    retention_interval_hours: int = 24   # background cleanup cadence; 0 = manual only
+    # Role tokens, all sent as X-Operator-Token. viewer: read; operator
+    # (OPERATOR_TOKEN): acknowledge/resolve/pin/run simulations; admin
+    # (ADMIN_TOKEN): settings, retention, test notifications. With ADMIN_TOKEN
+    # unset the operator token also holds admin rights (and a warning is shown).
+    viewer_token: str = ""
+    admin_token: str = ""
+    # Require a token even to read (viewer, operator or admin).
+    require_view_auth: bool = False
     # Built frontend to serve at "/", if present.
     static_dir: Path = REPO_ROOT / "frontend" / "dist"
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -11,13 +12,25 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from app.api.auth import PERMISSIONS, caller_for, configured_tokens, read_requires_auth, require_admin, require_operator
+from app.api.auth import read_access
+from app.correlation.engine import RULES as CORRELATION_RULES, CorrelationEngine, correlate
+from app.correlation.events import ADAPTER_STATUS, normalize_all
+from app.correlation.synthetic import demo_records
 from app.demo import MAX_DURATION_S, MIN_DURATION_S, SCENARIO_NAMES, SCENARIOS
+from app.incidents.timeline import (
+    TimelineQuery, build_timeline, entry_detail, load_timeline_data, ALL_SOURCES,
+)
+from app.incidents.explain import detection_rule
 from app.incidents.view import KIND_TITLE, STATUS_LABEL, incident_view
 from app.models import Incident, IncidentEvent
 from app.notify.mailer import ALLOWED_MIN_SEVERITIES, parse_recipients
 from app.pipeline import Pipeline
+from app.simulation.runner import run_benchmark, run_scenario_threaded
+from app.simulation.scenarios import DEFAULT_BENCHMARK_SEEDS, SCENARIOS as SIM_SCENARIOS
+from app.simulation.scenarios import list_scenarios as list_sim_scenarios
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(read_access)])
 
 _SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 _SEVERITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
@@ -31,24 +44,6 @@ logger = logging.getLogger(__name__)
 def _pipeline(request: Request) -> Pipeline:
     return request.app.state.pipeline
 
-
-def require_operator(request: Request, x_operator_token: Optional[str] = Header(default=None)) -> str:
-    """Role check for state-changing endpoints. Returns the actor name for the audit log.
-
-    Roles: *viewer* (no token; read-only API) and *operator* (sends the
-    X-Operator-Token). With ``OPERATOR_TOKEN`` unset, local development leaves
-    controls open; in production (or REQUIRE_OPERATOR_TOKEN=true) a missing
-    server token closes them instead of leaving them open."""
-    settings = _pipeline(request).settings
-    expected = settings.operator_token
-    if not expected:
-        if settings.auth_required:
-            raise HTTPException(status_code=403, detail="operator access is not configured on this server")
-        return "local"
-    if not (x_operator_token and hmac.compare_digest(x_operator_token, expected)):
-        logger.warning("rejected operator request to %s %s", request.method, request.url.path)
-        raise HTTPException(status_code=401, detail="operator token required")
-    return "operator"
 
 
 # -- health / services -------------------------------------------------------
@@ -274,28 +269,14 @@ async def incident_detail(incident_id: int, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="incident not found")
     events = await pipeline.store.list_incident_events(incident_id)
     alerts_ = await pipeline.store.list_alerts(limit=200, incident_id=incident_id)
-    evidence = await pipeline.store.list_evidence(incident_id, limit=100)
+    evidence = pipeline.redactor.redact_value(await pipeline.store.list_evidence(incident_id, limit=100))
     return {
         "incident": incident_view(incident),
         "events": [e.model_dump(mode="json") for e in events],
         "alerts": [a.model_dump(mode="json") for a in alerts_],
         "evidence": evidence,
-        "detection": _detection_rule(pipeline, incident.kind),
+        "detection": detection_rule(pipeline.config, incident.kind),
     }
-
-
-def _detection_rule(pipeline: Pipeline, kind: str) -> dict[str, Any]:
-    """The rule an incident of this kind was detected by, in config terms, so
-    the UI can explain *why* rather than just *that*."""
-    a, s, h, w = pipeline.config.anomaly, pipeline.config.severity, pipeline.config.hipaa, pipeline.config.window
-    if kind == "error_rate":
-        return {"metric": "error_rate", "z_threshold": a.error_rate_z_threshold, "min_errors": a.error_rate_min_errors,
-                "min_rate": a.error_rate_min_rate, "min_std": a.min_std, "window_seconds": w.size_seconds,
-                "step_seconds": w.step_seconds, "severity": s.model_dump()}
-    if kind == "latency_degradation":
-        return {"metric": "p95_latency_ms", "z_threshold": a.latency_z_threshold, "min_std": a.latency_min_std_ms,
-                "window_seconds": w.size_seconds, "step_seconds": w.step_seconds, "severity": s.model_dump()}
-    return {"metric": kind, "rolling_window_minutes": 10, "hipaa": h.model_dump()}
 
 
 async def _lifecycle(request: Request, incident_id: int, actor: str, action: str, apply, not_found: str) -> dict[str, Any]:
@@ -338,6 +319,13 @@ async def mute_incident(
 ) -> dict[str, Any]:
     return await _lifecycle(request, incident_id, actor, "mute" if payload.minutes else "unmute",
                             lambda eng, now: eng.mute(incident_id, now, payload.minutes), "incident not found")
+
+
+@router.post("/incidents/{incident_id}/reopen")
+async def reopen_incident(incident_id: int, request: Request, actor: str = Depends(require_operator)) -> dict[str, Any]:
+    return await _lifecycle(request, incident_id, actor, "reopen",
+                            lambda engine, now: engine.reopen(incident_id, now),
+                            "incident not found, not resolved, or superseded by a newer incident")
 
 
 async def _set_pinned(request: Request, incident_id: int, pinned: bool, actor: str) -> dict[str, Any]:
@@ -574,12 +562,12 @@ async def email_status(request: Request) -> dict[str, Any]:
     return _pipeline(request).email.status_dict()
 
 
-@router.post("/aws/test-connection", dependencies=[Depends(require_operator)])
+@router.post("/aws/test-connection", dependencies=[Depends(require_admin)])
 async def aws_test_connection(request: Request) -> dict[str, Any]:
     return await _pipeline(request).notifier.test_connection()
 
 
-@router.post("/aws/test-alert", dependencies=[Depends(require_operator)])
+@router.post("/aws/test-alert", dependencies=[Depends(require_admin)])
 async def aws_test_alert(request: Request) -> dict[str, Any]:
     return await _pipeline(request).notifier.send_test_alert()
 
@@ -665,7 +653,7 @@ async def get_notification_settings(request: Request) -> dict[str, Any]:
 
 @router.put("/settings/notifications")
 async def put_notification_settings(
-    request: Request, payload: NotificationSettingsIn, actor: str = Depends(require_operator)
+    request: Request, payload: NotificationSettingsIn, actor: str = Depends(require_admin)
 ) -> dict[str, Any]:
     pipeline = _pipeline(request)
     try:
@@ -686,7 +674,7 @@ async def put_notification_settings(
 
 
 @router.post("/settings/notifications/test")
-async def send_test_notification(request: Request, actor: str = Depends(require_operator)) -> dict[str, Any]:
+async def send_test_notification(request: Request, actor: str = Depends(require_admin)) -> dict[str, Any]:
     """Send one test email to the saved recipients. Reports whether the PROVIDER
     ACCEPTED it; inbox delivery is not observable from here."""
     pipeline = _pipeline(request)
@@ -734,3 +722,315 @@ async def demo_inject(request: Request, payload: InjectRequest) -> dict[str, Any
         raise HTTPException(status_code=422, detail=f"unknown scenario: {payload.scenario}")
     pipeline.write_control_file(payload.scenario, payload.duration_s)
     return {"scenario": payload.scenario, "duration_s": payload.duration_s}
+
+
+# -- who am I / security posture / retention ---------------------------------
+
+
+@router.get("/me")
+async def me(request: Request, x_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    """The caller's role, so the UI can show only the controls that will work."""
+    caller = caller_for(request, x_operator_token)
+    return {
+        "role": caller.role, "actor": caller.actor, "authenticated": caller.authenticated,
+        "open_access": caller.open_access,
+        "can": {"operate": caller.role in ("operator", "admin"), "admin": caller.role == "admin"},
+    }
+
+
+def _security_warnings(pipeline: Pipeline) -> list[dict[str, str]]:
+    s = pipeline.settings
+    out: list[dict[str, str]] = []
+
+    def warn(code: str, level: str, message: str) -> None:
+        out.append({"code": code, "level": level, "message": message})
+
+    if not configured_tokens(s):
+        if s.auth_required:
+            warn("controls_locked", "info", "No operator token is configured, so state-changing actions are refused.")
+        else:
+            warn("auth_disabled", "critical",
+                 "Authentication is DISABLED: anyone who can reach this server can acknowledge, resolve, change "
+                 "settings and run cleanup. Set OPERATOR_TOKEN (and ADMIN_TOKEN) before exposing it.")
+    elif s.operator_token and not s.admin_token:
+        warn("roles_collapsed", "warning",
+             "ADMIN_TOKEN is not set, so the operator token also holds admin rights (settings, retention).")
+    if not read_requires_auth(s):
+        warn("view_open", "warning" if configured_tokens(s) else "info",
+             "Incidents and events can be read without a token. Set VIEWER_TOKEN or REQUIRE_VIEW_AUTH=true to restrict.")
+    if not s.redaction_enabled:
+        warn("redaction_disabled", "critical", "Sensitive-field redaction is OFF (REDACTION_ENABLED=false).")
+    if pipeline.retention.all_disabled:
+        warn("retention_disabled", "warning", "Every retention rule is disabled: data is kept forever.")
+    if "*" in [o.strip() for o in s.cors_origins.split(",")]:
+        warn("cors_wildcard", "warning", "CORS allows every origin.")
+    if s.environment.lower() in ("production", "prod") and pipeline.store.dialect == "sqlite":
+        warn("sqlite_in_production", "warning", "Production is using local SQLite instead of PostgreSQL.")
+    if s.data_source == "simulated":
+        warn("simulated_data", "info", "Data is synthetic. No real patient data should be connected without a security review.")
+    return out
+
+
+@router.get("/security/status")
+async def security_status(request: Request) -> dict[str, Any]:
+    pipeline = _pipeline(request)
+    s = pipeline.settings
+    return {
+        "warnings": _security_warnings(pipeline),
+        "auth": {
+            "operator_token_configured": bool(s.operator_token), "admin_token_configured": bool(s.admin_token),
+            "viewer_token_configured": bool(s.viewer_token), "read_requires_auth": read_requires_auth(s),
+            "required_in_this_environment": s.auth_required,
+        },
+        "roles": PERMISSIONS,
+        "redaction": {"enabled": s.redaction_enabled},
+        "retention": {"policy": pipeline.retention.describe(), "last_run": pipeline.last_retention_run,
+                      "interval_hours": s.retention_interval_hours},
+        "processing": {"data_source": s.data_source, "database": pipeline.store.dialect,
+                       "cloud_integrations": {"aws_mode": s.aws_mode, "email_enabled": s.email_enabled}},
+        "not_verified": [
+            "No regulatory compliance (HIPAA, SOC 2, HITRUST) is claimed or has been assessed.",
+            "Token roles are a basic control, not per-user identity or SSO; use a gateway or identity provider in production.",
+            "Redaction is pattern/field based and cannot prove a log line contains no identifiers.",
+            "A penetration test, threat model and professional security review have not been done.",
+        ],
+    }
+
+
+@router.get("/admin/retention")
+async def retention_status(request: Request) -> dict[str, Any]:
+    """The policy and what a cleanup would delete right now (dry run)."""
+    pipeline = _pipeline(request)
+    preview = await pipeline.run_retention(dry_run=True)
+    return {"policy": pipeline.retention.describe(), "would_delete": preview["deleted"],
+            "last_run": pipeline.last_retention_run}
+
+
+@router.post("/admin/retention/run")
+async def retention_run(request: Request, actor: str = Depends(require_admin)) -> dict[str, Any]:
+    return await _pipeline(request).run_retention(actor=actor)
+
+
+# -- Incident Time Machine (read-only) ---------------------------------------
+
+
+async def _incident_or_404(pipeline: Pipeline, incident_id: int) -> Incident:
+    incident = pipeline.incidents.get(incident_id) or await pipeline.store.get_incident(incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+    return incident
+
+
+@router.get("/incidents/{incident_id}/timeline")
+async def incident_timeline(
+    incident_id: int, request: Request,
+    before_minutes: float = Query(default=15, ge=0, le=1440),
+    after_minutes: float = Query(default=15, ge=0, le=1440),
+    sources: Optional[str] = Query(default=None, description="comma list of metrics,alerts,lifecycle,evidence"),
+    as_of: Optional[datetime] = Query(default=None, description="replay: the state and events up to this time"),
+    max_points: int = Query(default=240, ge=10, le=2000),
+) -> dict[str, Any]:
+    """Events before, during and after the incident with explicit coverage.
+    GET-only and read-only: replaying never modifies stored records."""
+    pipeline = _pipeline(request)
+    incident = await _incident_or_404(pipeline, incident_id)
+    chosen = tuple(v.strip().lower() for v in (sources or "").split(",") if v.strip()) or ALL_SOURCES
+    if any(v not in ALL_SOURCES for v in chosen):
+        raise HTTPException(status_code=422, detail=f"sources must be from {list(ALL_SOURCES)}")
+    query = TimelineQuery(before_minutes=before_minutes, after_minutes=after_minutes,
+                          max_metric_points=max_points, sources=chosen, as_of=as_of)
+    now = datetime.now(timezone.utc)
+    data = await load_timeline_data(pipeline.store, incident, query, now)
+    return build_timeline(data, query, pipeline.config, now=now, retention_hours=pipeline.retention.metrics_hours,
+                          redact=pipeline.redactor.redact_value)
+
+
+@router.get("/incidents/{incident_id}/timeline/{entry_id:path}")
+async def incident_timeline_entry(incident_id: int, entry_id: str, request: Request) -> dict[str, Any]:
+    """Raw, log-safe details of one timeline entry (metric, alert, lifecycle or evidence)."""
+    pipeline = _pipeline(request)
+    incident = await _incident_or_404(pipeline, incident_id)
+    kind, _, ref = entry_id.partition(":")
+    redact = pipeline.redactor.redact_value
+    store = pipeline.store
+    if kind == "metric" and incident.service:
+        ts = _parse_ts(ref)
+        rows = await store.list_metrics_between(service=incident.service, start=ts, end=ts, limit=1)
+        if rows:
+            return entry_detail("metric", rows[0], redact)
+    elif kind == "alert" and ref.isdigit():
+        alert = await store.get_alert(int(ref))
+        if alert is not None and (alert.incident_id == incident_id or alert.service == incident.service
+                                  or (alert.user_id is not None and alert.user_id == incident.user_id)):
+            return entry_detail("alert", alert, redact)
+    elif kind == "lifecycle" and ref.isdigit():
+        event = await store.get_incident_event(incident_id, int(ref))
+        if event is not None:
+            return entry_detail("lifecycle", event, redact)
+    elif kind == "evidence" and ref.isdigit():
+        row = await store.get_evidence(incident_id, int(ref))
+        if row is not None:
+            return entry_detail("evidence", row, redact)
+    raise HTTPException(status_code=404, detail="timeline entry not found (it may have expired under the retention policy)")
+
+
+def _parse_ts(value: str) -> datetime:
+    try:
+        ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid timestamp in entry id") from None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+# -- synthetic incident simulator ----------------------------------------------------------
+# Runs the real detection pipeline on generated data in an isolated temporary
+# database. See app/simulation/runner.py for the safety properties.
+
+_sim_lock = asyncio.Lock()
+
+
+class SimulationRequest(BaseModel):
+    scenario_id: str
+    seed: Optional[int] = Field(default=None, ge=0, le=2**31 - 1)
+
+
+class BenchmarkRequest(BaseModel):
+    seeds: list[int] = Field(default_factory=lambda: list(DEFAULT_BENCHMARK_SEEDS), min_length=1, max_length=3)
+    scenario_ids: Optional[list[str]] = Field(default=None, max_length=10)
+
+
+@router.get("/simulations/scenarios")
+async def simulation_scenarios() -> dict[str, Any]:
+    return {"scenarios": list_sim_scenarios(), "synthetic_only": True,
+            "note": "Simulations use generated data in a temporary database. They never touch real systems, "
+                    "this dashboard's incidents, or any notification channel."}
+
+
+@router.post("/simulations/run")
+async def run_simulation(payload: SimulationRequest, request: Request,
+                         actor: str = Depends(require_operator)) -> dict[str, Any]:
+    if payload.scenario_id not in SIM_SCENARIOS:
+        raise HTTPException(status_code=404, detail="unknown scenario")
+    if _sim_lock.locked():
+        raise HTTPException(status_code=409, detail="a simulation is already running")
+    pipeline = _pipeline(request)
+    async with _sim_lock:
+        result = await run_scenario_threaded(payload.scenario_id, payload.seed)
+        run_id = await pipeline.store.save_simulation_run(
+            created_at=datetime.now(timezone.utc), scenario_id=result["scenario_id"], seed=result["seed"],
+            passed=result["passed"], summary=result["summary"], result=result, requested_by=actor)
+    await pipeline.audit(actor, "simulate", "simulation", run_id)
+    return {"id": run_id, **result}
+
+
+@router.post("/simulations/benchmark")
+async def run_simulation_benchmark(payload: BenchmarkRequest, request: Request,
+                                   actor: str = Depends(require_admin)) -> dict[str, Any]:
+    ids = payload.scenario_ids or list(SIM_SCENARIOS)
+    unknown = [i for i in ids if i not in SIM_SCENARIOS]
+    if unknown:
+        raise HTTPException(status_code=404, detail=f"unknown scenario: {unknown[0]}")
+    if _sim_lock.locked():
+        raise HTTPException(status_code=409, detail="a simulation is already running")
+    pipeline = _pipeline(request)
+    async with _sim_lock:
+        result = await asyncio.to_thread(run_benchmark, tuple(payload.seeds), ids)
+        s = result["summary"]
+        summary = (f"{s['detected']}/{s['injected_runs']} detected, "
+                   f"{s['control_false_positives']} control false positives")
+        run_id = await pipeline.store.save_simulation_run(
+            created_at=datetime.now(timezone.utc), scenario_id="benchmark", seed=payload.seeds[0],
+            passed=s["passed"] == s["runs"], summary=summary, result=result, requested_by=actor)
+    await pipeline.audit(actor, "simulate", "simulation", run_id)
+    return {"id": run_id, **result}
+
+
+@router.get("/simulations/runs")
+async def simulation_runs(request: Request, limit: int = Query(20, ge=1, le=100),
+                          scenario_id: Optional[str] = None) -> dict[str, Any]:
+    return {"items": await _pipeline(request).store.list_simulation_runs(limit=limit, scenario_id=scenario_id)}
+
+
+@router.get("/simulations/runs/{run_id}")
+async def simulation_run(run_id: int, request: Request) -> dict[str, Any]:
+    row = await _pipeline(request).store.get_simulation_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="simulation run not found")
+    return row
+
+
+# -- cross-system correlation ----------------------------------------------------------------
+
+
+class CorrelationRecord(BaseModel):
+    source: Literal["app", "auth", "audit", "server", "db_audit"]
+    record: dict[str, Any]
+
+
+class CorrelationRequest(BaseModel):
+    events: list[CorrelationRecord] = Field(max_length=500)
+
+
+def _correlation_view(pipeline: Pipeline, result: dict[str, Any]) -> dict[str, Any]:
+    return pipeline.redactor.redact_value(result)
+
+
+@router.get("/correlation/rules")
+async def correlation_rules() -> dict[str, Any]:
+    return {"rules": [r.describe() for r in CORRELATION_RULES], "adapters": ADAPTER_STATUS,
+            "note": "server and db_audit adapters use a documented synthetic format and are not validated "
+                    "against any real product."}
+
+
+@router.get("/correlation/demo")
+async def correlation_demo(request: Request) -> dict[str, Any]:
+    events, skipped = normalize_all(demo_records())
+    return {"synthetic": True, **_correlation_view(_pipeline(request), correlate(events, adapter_skipped=skipped))}
+
+
+@router.post("/correlation/analyze")
+async def correlation_analyze(payload: CorrelationRequest, request: Request) -> dict[str, Any]:
+    """Correlate caller-supplied records. Computation only: nothing is stored."""
+    events, skipped = normalize_all([(e.source, e.record) for e in payload.events])
+    return _correlation_view(_pipeline(request), correlate(events, adapter_skipped=skipped))
+
+
+@router.get("/incidents/{incident_id}/correlation")
+async def incident_correlation(
+    incident_id: int, request: Request, window_minutes: float = Query(default=15, ge=1, le=240),
+) -> dict[str, Any]:
+    """Which other events, from which other systems, belong with this incident
+    and why. Uses the incident's captured evidence plus recent logs in memory;
+    groups that do not involve this incident's actor or service are dropped."""
+    pipeline = _pipeline(request)
+    incident = await _incident_or_404(pipeline, incident_id)
+    now = datetime.now(timezone.utc)
+    start = incident.opened_at - timedelta(minutes=window_minutes)
+    end = (incident.resolved_at or now) + timedelta(minutes=window_minutes)
+    records: list[tuple[str, dict[str, Any]]] = []
+    for row in await pipeline.store.list_evidence(incident_id, limit=200):
+        rec = row["record"]
+        if rec.get("type") in ("app", "auth", "audit"):
+            records.append((rec["type"], rec))
+    for rec in list(pipeline.recent_logs):
+        try:
+            ts = datetime.fromisoformat(rec["ts"])
+        except (KeyError, ValueError):
+            continue
+        if start <= ts <= end and rec.get("type") in ("app", "auth", "audit"):
+            records.append((rec["type"], rec))
+    events, skipped = normalize_all(records)
+    engine = CorrelationEngine()
+    engine.add_all(events)
+    result = engine.result(adapter_skipped=skipped)
+
+    def relevant(group: dict[str, Any]) -> bool:
+        return any((e["actor"] and e["actor"] == incident.user_id) or (e["service"] and e["service"] == incident.service)
+                   for e in group["events"])
+
+    result["groups"] = [g for g in result["groups"] if relevant(g)]
+    result.update({"incident_id": incident_id, "window": {"start": start.isoformat(), "end": end.isoformat()},
+                   "inputs": {"evidence_and_recent_logs": len(records)},
+                   "limits": "Only the application, authentication and audit logs this system ingests are "
+                             "available here; server and database audit sources need an adapter."})
+    return _correlation_view(pipeline, result)

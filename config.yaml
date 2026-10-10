@@ -121,6 +121,17 @@ incident:
   cooldown_minutes: 5
   service_auto_resolve_windows: 6
   hipaa_auto_resolve_minutes: 10
+  # A recurrence of the same fingerprint within this many minutes after
+  # resolution reopens the incident (one problem, one incident). Later
+  # recurrences open a new incident. 0 disables reopening.
+  reopen_window_minutes: 3
+
+# Failed logins followed by a successful one (auth.log).
+auth:
+  failure_threshold: 5
+  window_minutes: 10
+  high_failure_multiple: 2
+  realert_seconds: 60
 
 window:
   size_seconds: 60

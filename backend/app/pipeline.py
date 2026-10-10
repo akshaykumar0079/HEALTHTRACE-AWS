@@ -31,6 +31,7 @@ from typing import Any, Optional, Union
 from app.api.ws import Broadcaster
 from app.config import AppConfig, Settings
 from app.detect.access import AccessDetector
+from app.detect.auth import AuthDetector, score_auth_anomaly
 from app.detect.anomaly import AnomalyEngine
 from app.detect.baseline import BaselineEngine
 from app.detect.severity import score_hipaa_anomaly, score_service_anomaly
@@ -38,11 +39,13 @@ from app.detect.window import SlidingWindow
 from app.incidents.engine import IncidentEngine, IncidentUpdate, fingerprint_for
 from app.incidents.view import incident_view
 from app.ingest.tailer import Tailer
-from app.models import Alert, Anomaly, AppEvent, AuditEvent, WindowMetrics
+from app.models import Alert, Anomaly, AppEvent, AuditEvent, AuthEvent, WindowMetrics
 from app.notify.aws import AwsNotifier
 from app.notify.mailer import EmailNotifier, EmailSettings
 from app.parse.enricher import Enricher
 from app.parse.parser import Parser
+from app.privacy.redaction import Redactor
+from app.privacy.retention import RetentionPolicy, apply_retention
 from app.store.db import Store
 
 logger = logging.getLogger(__name__)
@@ -117,8 +120,12 @@ class Pipeline:
         self.baseline = BaselineEngine(config.baseline)
         self.anomaly_engine = AnomalyEngine(config.anomaly, self.baseline)
         self.access_detector = AccessDetector(config.hipaa)
+        self.auth_detector = AuthDetector(config.auth)
         self.incidents = IncidentEngine(config.incident)
         self.store = Store(settings.db_path, settings.database_url or None)
+        self.retention = RetentionPolicy.from_settings(settings)
+        self.store.metrics_retention_hours = self.retention.metrics_hours
+        self.last_retention_run: Optional[dict[str, Any]] = None
         self.notifier = AwsNotifier(
             mode=settings.aws_mode,
             region=settings.aws_region,
@@ -128,6 +135,13 @@ class Pipeline:
             mock_log_path=settings.log_dir.parent / "aws_mock.log",
         )
         self.email = EmailNotifier(EmailSettings.from_settings(settings), app_config=config)
+        self.redactor = Redactor.build(
+            enabled=settings.redaction_enabled,
+            extra_fields=settings.redact_extra_fields.split(","),
+            extra_patterns=settings.redact_extra_patterns.split(","),
+        )
+        self.notifier.redact = self.redactor.redact_value
+        self.email.redact = self.redactor.redact_value
         self.broadcaster = Broadcaster()
         self.db_errors = 0
         self.last_db_error: Optional[str] = None
@@ -142,7 +156,7 @@ class Pipeline:
         self._hipaa_last_alert: dict[str, tuple[datetime, int]] = {}
 
         self.started_at: Optional[datetime] = None
-        self.events_processed = {"app": 0, "audit": 0}
+        self.events_processed = {"app": 0, "audit": 0, "auth": 0}
         self.alerts_emitted = 0
         self._throughput: "deque[dict[str, Any]]" = deque(maxlen=THROUGHPUT_HISTORY)
         self._last_tick_counts = (0, 0)
@@ -177,7 +191,7 @@ class Pipeline:
         # the end rather than learning the same history twice.
         first_run = not positions and self.baseline.is_empty()
         self._tailers = []
-        for name in ("app.log", "audit.log"):
+        for name in ("app.log", "audit.log", "auth.log"):
             path = self.settings.log_dir / name
             saved = positions.get(str(path))
             self._tailers.append(
@@ -194,6 +208,8 @@ class Pipeline:
         self._consumer_task = asyncio.create_task(self._consume())
         self._tasks.append(asyncio.create_task(self._periodic_save()))
         self._tasks.append(asyncio.create_task(self._heartbeat()))
+        if self.settings.retention_interval_hours > 0:
+            self._tasks.append(asyncio.create_task(self._retention_loop()))
         self._tasks.append(asyncio.create_task(self._tick()))
 
     async def stop(self) -> None:
@@ -310,6 +326,29 @@ class Pipeline:
             # in flight between a tailer and the consumer.
             await self._save_state(save_positions=self.queue._unfinished_tasks == 0)  # noqa: SLF001
 
+    async def run_retention(self, *, dry_run: bool = False, actor: str = "system") -> dict[str, Any]:
+        """Apply the retention policy. Never raises: a cleanup failure must not
+        stop detection."""
+        started = datetime.now(timezone.utc)
+        try:
+            deleted = await apply_retention(self.store, self.retention, now=started, dry_run=dry_run)
+            outcome = {"ran_at": started.isoformat(), "dry_run": dry_run, "deleted": deleted, "error": None}
+        except Exception as exc:
+            self._db_failed("retention cleanup", exc)
+            outcome = {"ran_at": started.isoformat(), "dry_run": dry_run, "deleted": {}, "error": type(exc).__name__}
+        if not dry_run:
+            self.last_retention_run = outcome
+            await self.audit(actor, "retention.run", "system", detail=str(outcome["deleted"])[:300],
+                             outcome="ok" if outcome["error"] is None else "failed")
+        return outcome
+
+    async def _retention_loop(self) -> None:
+        interval = self.settings.retention_interval_hours * 3600
+        await asyncio.sleep(60)  # let start-up finish first
+        while True:
+            await self.run_retention()
+            await asyncio.sleep(interval)
+
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -370,6 +409,9 @@ class Pipeline:
         if isinstance(event, AppEvent):
             self.events_processed["app"] += 1
             await self._process_app_event(event)
+        elif isinstance(event, AuthEvent):
+            self.events_processed["auth"] += 1
+            await self._process_auth_event(event)
         else:
             self.events_processed["audit"] += 1
             await self._process_audit_event(event)
@@ -492,6 +534,13 @@ class Pipeline:
 
         await self._sweep_hipaa()
 
+    async def _process_auth_event(self, event: AuthEvent) -> None:
+        self._advance_clock(event.ts)
+        for anomaly in self.auth_detector.evaluate(event):
+            alert = score_auth_anomaly(anomaly, self.config.auth)
+            await self._handle_alert(anomaly, alert)
+        await self._sweep_hipaa()
+
     def _hipaa_should_alert(self, anomaly: Anomaly, alert: Alert) -> bool:
         """The access detector reports a pattern on every event that exhibits
         it; re-alerting an unchanged pattern more than once per
@@ -546,8 +595,9 @@ class Pipeline:
                     continue
                 if delta < 0 and not self.replay_active:
                     continue
-                if alert.kind.startswith("hipaa_"):
-                    if record.get("type") != "audit" or record.get("user_id") != alert.user_id or delta > 600:
+                if alert.kind.startswith("hipaa_") or alert.kind.startswith("auth_"):
+                    want = "auth" if alert.kind.startswith("auth_") else "audit"
+                    if record.get("type") != want or record.get("user_id") != alert.user_id or delta > 600:
                         continue
                 else:
                     if record.get("type") != "app" or record.get("service") != alert.service or delta > 120:
@@ -571,7 +621,11 @@ class Pipeline:
         if not records:
             return
         try:
-            await self.store.save_evidence(incident.id, alert.id, records)
+            await self.store.save_evidence(incident.id, alert.id, self.redactor.redact_records(records))
+            count = await self.store.count_evidence(incident.id)
+            if count != incident.evidence_count:
+                incident.evidence_count = count
+                await self.store.upsert_incident(incident)
         except Exception as exc:
             self._db_failed("save evidence", exc)
 
@@ -599,7 +653,7 @@ class Pipeline:
         if len(self.recent_alerts) > self._MAX_RECENT_ALERTS:
             self.recent_alerts = self.recent_alerts[-self._MAX_RECENT_ALERTS :]
 
-    def _remember_log(self, event: Union[AppEvent, AuditEvent]) -> None:
+    def _remember_log(self, event: Union[AppEvent, AuditEvent, AuthEvent]) -> None:
         self._log_seq += 1
         if isinstance(event, AppEvent):
             record = {
@@ -607,6 +661,14 @@ class Pipeline:
                 "level": event.level, "priority": event.priority, "request_id": event.request_id,
                 "patient_id": mask_patient_id(event.patient_id), "status": event.status,
                 "latency_ms": event.latency_ms, "msg": event.msg, "is_error": event.is_error,
+            }
+        elif isinstance(event, AuthEvent):
+            record = {
+                "seq": self._log_seq, "ts": event.ts.isoformat(), "type": "auth", "user_id": event.user_id,
+                "outcome": event.outcome, "method": event.method, "source_region": event.source_region,
+                "user_region": event.user_region, "source_ip": event.source_ip,
+                "level": "WARN" if event.outcome == "failure" else "INFO",
+                "msg": f"{event.user_id} login {event.outcome} from {event.source_region}",
             }
         else:
             record = {

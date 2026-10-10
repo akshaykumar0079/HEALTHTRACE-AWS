@@ -209,6 +209,40 @@ async def _m002_incident_workflow(db: Database) -> None:
     )
 
 
+async def _m003_time_machine(db: Database) -> None:
+    """Risk trend / reopen / evidence counters on incidents, stored simulation
+    runs, and indexes for the investigation timeline."""
+    real = db.real
+    for column, ddl in (
+        ("latest_score", real),
+        ("risk_trend", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("reopen_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("evidence_count", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        await db.add_column_if_missing("incidents", column, ddl)
+    await db.execute(
+        "UPDATE incidents SET evidence_count = "
+        "(SELECT COUNT(*) FROM evidence_events e WHERE e.incident_id = incidents.id) WHERE evidence_count = 0"
+    )
+    await db.run_script(
+        f"""
+        CREATE TABLE IF NOT EXISTS simulation_runs (
+            id {db.pk},
+            created_at TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            passed INTEGER NOT NULL,
+            summary TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            requested_by TEXT NOT NULL DEFAULT 'local'
+        );
+        CREATE INDEX IF NOT EXISTS idx_sim_runs_created ON simulation_runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_alerts_incident_ts ON alerts(incident_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_metrics_service_ts ON metrics(service, window_end)
+        """
+    )
+
+
 @dataclass(frozen=True)
 class Migration:
     version: int
@@ -219,6 +253,7 @@ class Migration:
 MIGRATIONS: list[Migration] = [
     Migration(1, "baseline_schema", _m001_baseline_schema),
     Migration(2, "incident_workflow", _m002_incident_workflow),
+    Migration(3, "time_machine", _m003_time_machine),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1].version

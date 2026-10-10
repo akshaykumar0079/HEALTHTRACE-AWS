@@ -92,6 +92,7 @@ _TITLES: dict[str, str] = {
     "hipaa_bulk_export": "Bulk PHI Export Detected",
     "hipaa_off_hours": "Off-Hours PHI Access Detected",
     "hipaa_region_mismatch": "Cross-Region PHI Access Detected",
+    "auth_suspicious_login": "Suspicious Login Detected",
 }
 
 # SMTP errors that will not fix themselves on retry.
@@ -194,6 +195,8 @@ class EmailNotifier:
         # Injected in tests; resolved at send time otherwise, so patching
         # smtplib (the test-suite guard does) always takes effect.
         self._smtp_factory = smtp_factory
+        # Applied to text leaving the process; the pipeline sets the redactor.
+        self.redact: Callable[[Any], Any] = lambda value: value
         self._queue: "asyncio.Queue[tuple[Incident, Alert, bool]]" = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
         self.status = ChannelStatus()
@@ -519,7 +522,7 @@ class EmailNotifier:
 
     def build_message(self, incident: Incident, alert: Alert, *, escalated: bool = False) -> EmailMessage:
         s = self.settings
-        rows = self._rows(incident, alert, escalated)
+        rows = [(label, self.redact(value)) for label, value in self._rows(incident, alert, escalated)]
 
         text_lines = ["HEALTHTRACE SECURITY ALERT", ""]
         for label, value in rows:
@@ -621,6 +624,9 @@ class EmailNotifier:
             return "Patient records accessed outside business hours" + extra + "."
         if kind == "hipaa_region_mismatch":
             return "User accessed records of patients registered in a different region from their own."
+        if kind == "auth_suspicious_login":
+            return ("A successful login followed repeated failed logins for the same user within the rolling "
+                    "window; it is more serious when it comes from an unfamiliar region.")
         return alert.kind
 
     def _affected(self, alert: Alert) -> str:
@@ -638,6 +644,8 @@ class EmailNotifier:
             parts.append(f"Distinct patient records: {m['distinct_patients']}")
         if "records" in m:
             parts.append(f"Records: {m['records']}")
+        if "failures" in m:
+            parts.append(f"Failed logins before success: {m['failures']}")
         parts.append("Patient identifiers are deliberately not included in this email.")
         return "\n".join(parts)
 
@@ -683,6 +691,9 @@ class EmailNotifier:
         if kind == "hipaa_region_mismatch":
             return (f"Verify that {alert.user_id} is assigned to these patients' region; if not, restrict "
                     "access and review the audit log.")
+        if kind == "auth_suspicious_login":
+            return (f"Contact {alert.user_id} to confirm the login. If it was not them, reset the credentials, "
+                    "revoke active sessions and review the audit log.")
         return "Investigate the incident in HEALTHTRACE."
 
     # -- manual test (scripts/test_email.py) ------------------------------------

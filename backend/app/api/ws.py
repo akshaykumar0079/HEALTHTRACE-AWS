@@ -84,6 +84,13 @@ class Broadcaster:
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     pipeline = ws.app.state.pipeline
+    from app.api.auth import read_requires_auth, resolve_caller
+
+    if read_requires_auth(pipeline.settings):
+        token = ws.query_params.get("token")
+        if resolve_caller(pipeline.settings, token) is None:
+            await ws.close(code=1008)
+            return
     await ws.accept()
     client = _Client(ws)
     client.queue.put_nowait(json.dumps(pipeline.snapshot(), default=str))

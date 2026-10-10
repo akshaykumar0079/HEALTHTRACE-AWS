@@ -31,6 +31,8 @@ class Store:
         self.database_url = database_url or None
         self._db: Optional[Database] = None
         self._last_prune_cutoff: Optional[datetime] = None
+        # Window-metric retention (hours); 0 keeps everything. Set from settings.
+        self.metrics_retention_hours = 24
 
     async def connect(self) -> None:
         db = create_database(self.db_path, self.database_url)
@@ -128,8 +130,10 @@ class Store:
                 metrics.baseline_mean, metrics.baseline_std,
             ),
         )
-        cutoff = metrics.window_end - timedelta(hours=24)
-        if self._last_prune_cutoff is None or cutoff - self._last_prune_cutoff >= timedelta(minutes=1):
+        cutoff = metrics.window_end - timedelta(hours=self.metrics_retention_hours or 24)
+        if self.metrics_retention_hours and (
+            self._last_prune_cutoff is None or cutoff - self._last_prune_cutoff >= timedelta(minutes=1)
+        ):
             await self.conn.execute("DELETE FROM metrics WHERE window_end < ?", (cutoff.isoformat(),))
             self._last_prune_cutoff = cutoff
         await self.conn.commit()
@@ -155,6 +159,103 @@ class Store:
             )
             for r in rows
         ]
+
+    async def list_metrics_between(
+        self, *, service: str, start: datetime, end: datetime, limit: int = 20000
+    ) -> list[WindowMetrics]:
+        """Persisted window metrics with ``start <= window_end <= end``, oldest first."""
+        cursor = await self.conn.execute(
+            """
+            SELECT service, window_end, total, errors, error_rate, p95_latency_ms,
+                   urgent_errors, affected_patients_urgent, affected_patients_routine, malformed_lines,
+                   baseline_mean, baseline_std
+            FROM metrics WHERE service = ? AND window_end >= ? AND window_end <= ?
+            ORDER BY window_end ASC LIMIT ?
+            """,
+            (service, start.isoformat(), end.isoformat(), limit),
+        )
+        return [
+            WindowMetrics(
+                service=r[0], window_end=datetime.fromisoformat(r[1]), total=r[2], errors=r[3], error_rate=r[4],
+                p95_latency_ms=r[5], urgent_errors=r[6], affected_patients_urgent=r[7],
+                affected_patients_routine=r[8], malformed_lines=r[9], baseline_mean=r[10], baseline_std=r[11],
+            )
+            for r in await cursor.fetchall()
+        ]
+
+    async def earliest_metric_ts(self, service: str) -> Optional[datetime]:
+        row = await (await self.conn.execute(
+            "SELECT MIN(window_end) FROM metrics WHERE service = ?", (service,))).fetchone()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+    async def list_alerts_between(
+        self, *, start: datetime, end: datetime, service: Optional[str] = None, user_id: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[Alert]:
+        clauses, params = ["ts >= ?", "ts <= ?"], [start.isoformat(), end.isoformat()]
+        if service is not None:
+            clauses.append("service = ?")
+            params.append(service)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        params.append(limit)
+        rows = await (await self.conn.execute(
+            "SELECT id, ts, kind, service, user_id, severity, score, explanation, metrics_json, incident_id "
+            f"FROM alerts WHERE {' AND '.join(clauses)} ORDER BY ts ASC, id ASC LIMIT ?", params)).fetchall()
+        return [_row_to_alert(r) for r in rows]
+
+    async def get_alert(self, alert_id: int) -> Optional[Alert]:
+        row = await (await self.conn.execute(
+            "SELECT id, ts, kind, service, user_id, severity, score, explanation, metrics_json, incident_id "
+            "FROM alerts WHERE id = ?", (alert_id,))).fetchone()
+        return _row_to_alert(row) if row else None
+
+    async def get_evidence(self, incident_id: int, evidence_id: int) -> Optional[dict[str, Any]]:
+        row = await (await self.conn.execute(
+            "SELECT id, alert_id, ts, record_json FROM evidence_events WHERE id = ? AND incident_id = ?",
+            (evidence_id, incident_id))).fetchone()
+        return {"id": row[0], "alert_id": row[1], "ts": row[2], "record": json.loads(row[3])} if row else None
+
+    async def get_incident_event(self, incident_id: int, event_id: int) -> Optional[IncidentEvent]:
+        for event in await self.list_incident_events(incident_id):
+            if event.id == event_id:
+                return event
+        return None
+
+    # -- simulation runs ------------------------------------------------------------
+
+    async def save_simulation_run(self, *, created_at: datetime, scenario_id: str, seed: int, passed: bool,
+                                  summary: str, result: dict[str, Any], requested_by: str = "local") -> int:
+        new_id = await self.conn.insert(
+            "INSERT INTO simulation_runs (created_at, scenario_id, seed, passed, summary, result_json, requested_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (created_at.isoformat(), scenario_id, seed, 1 if passed else 0, summary,
+             json.dumps(result), requested_by),
+        )
+        await self.conn.commit()
+        return new_id
+
+    async def list_simulation_runs(self, *, limit: int = 50, scenario_id: Optional[str] = None) -> list[dict[str, Any]]:
+        query = "SELECT id, created_at, scenario_id, seed, passed, summary, requested_by FROM simulation_runs"
+        params: list[object] = []
+        if scenario_id:
+            query += " WHERE scenario_id = ?"
+            params.append(scenario_id)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = await (await self.conn.execute(query, params)).fetchall()
+        return [{"id": r[0], "created_at": r[1], "scenario_id": r[2], "seed": r[3], "passed": bool(r[4]),
+                 "summary": r[5], "requested_by": r[6]} for r in rows]
+
+    async def get_simulation_run(self, run_id: int) -> Optional[dict[str, Any]]:
+        row = await (await self.conn.execute(
+            "SELECT id, created_at, scenario_id, seed, passed, summary, result_json, requested_by"
+            " FROM simulation_runs WHERE id = ?", (run_id,))).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "created_at": row[1], "scenario_id": row[2], "seed": row[3], "passed": bool(row[4]),
+                "summary": row[5], "requested_by": row[7], "result": json.loads(row[6])}
 
     # -- alerts (Milestone 4) -------------------------------------------------
 
@@ -208,14 +309,17 @@ class Store:
             INSERT INTO incidents
                 (id, fingerprint, kind, service, user_id, state, peak_severity, alert_count,
                  opened_at, acknowledged_at, resolved_at, mttr_seconds,
-                 pinned, pinned_at, investigating_at, last_seen_at, peak_score, muted_until)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 pinned, pinned_at, investigating_at, last_seen_at, peak_score, muted_until,
+                 latest_score, risk_trend, reopen_count, evidence_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 state=excluded.state, peak_severity=excluded.peak_severity, alert_count=excluded.alert_count,
                 acknowledged_at=excluded.acknowledged_at, resolved_at=excluded.resolved_at,
                 mttr_seconds=excluded.mttr_seconds, pinned=excluded.pinned, pinned_at=excluded.pinned_at,
                 investigating_at=excluded.investigating_at, last_seen_at=excluded.last_seen_at,
-                peak_score=excluded.peak_score, muted_until=excluded.muted_until
+                peak_score=excluded.peak_score, muted_until=excluded.muted_until,
+                latest_score=excluded.latest_score, risk_trend=excluded.risk_trend,
+                reopen_count=excluded.reopen_count, evidence_count=excluded.evidence_count
             """,
             (
                 incident.id, incident.fingerprint, incident.kind, incident.service, incident.user_id,
@@ -223,6 +327,7 @@ class Store:
                 _iso_or_none(incident.acknowledged_at), _iso_or_none(incident.resolved_at), incident.mttr_seconds,
                 1 if incident.pinned else 0, _iso_or_none(incident.pinned_at), _iso_or_none(incident.investigating_at),
                 _iso_or_none(incident.last_seen_at), incident.peak_score, _iso_or_none(incident.muted_until),
+                incident.latest_score, incident.risk_trend, incident.reopen_count, incident.evidence_count,
             ),
         )
         await self.conn.commit()
@@ -508,7 +613,7 @@ class Store:
     async def list_incident_events(self, incident_id: int) -> list[IncidentEvent]:
         cursor = await self.conn.execute(
             "SELECT id, incident_id, ts, event_type, severity, detail FROM incident_events "
-            "WHERE incident_id = ? ORDER BY ts ASC",
+            "WHERE incident_id = ? ORDER BY ts ASC, id ASC",
             (incident_id,),
         )
         rows = await cursor.fetchall()
@@ -555,7 +660,8 @@ def _row_to_alert(row) -> Alert:
 
 _INCIDENT_COLS = (
     "id, fingerprint, kind, service, user_id, state, peak_severity, alert_count, opened_at, acknowledged_at, "
-    "resolved_at, mttr_seconds, pinned, pinned_at, investigating_at, last_seen_at, peak_score, muted_until"
+    "resolved_at, mttr_seconds, pinned, pinned_at, investigating_at, last_seen_at, peak_score, muted_until, "
+    "latest_score, risk_trend, reopen_count, evidence_count"
 )
 
 
@@ -574,4 +680,6 @@ def _row_to_incident(row) -> Incident:
         acknowledged_at=_dt(row[9]), resolved_at=_dt(row[10]), mttr_seconds=row[11],
         pinned=bool(row[12]), pinned_at=_dt(row[13]), investigating_at=_dt(row[14]), last_seen_at=_dt(row[15]),
         peak_score=row[16], muted_until=_dt(row[17]),
+        latest_score=row[18], risk_trend=row[19] or "unknown", reopen_count=row[20] or 0,
+        evidence_count=row[21] or 0,
     )
