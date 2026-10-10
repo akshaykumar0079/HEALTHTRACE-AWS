@@ -97,7 +97,7 @@ function AlertDrawer({ alert, onClose }: { alert: Alert | null; onClose: () => v
                         #{alert.incident_id} {incident ? `is ${incident.state.toLowerCase()} with ${incident.alert_count} alerts` : ""}
                       </p>
                       <Link
-                        to={`/app/anomalies/${alert.incident_id}`}
+                        to={`/app/incidents/${alert.incident_id}`}
                         className="mt-3 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-signal"
                         onClick={onClose}
                       >

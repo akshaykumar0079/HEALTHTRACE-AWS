@@ -29,10 +29,13 @@ export const KIND_LABEL: Record<AnomalyKind, string> = {
 };
 
 export const STATE_LABEL: Record<IncidentState, string> = {
-  OPEN: "Active",
+  OPEN: "New",
   ACKNOWLEDGED: "Acknowledged",
+  INVESTIGATING: "Investigating",
   RESOLVED: "Resolved",
 };
+
+export const STATES: IncidentState[] = ["OPEN", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED"];
 
 export const isHipaaKind = (kind: AnomalyKind) => kind.startsWith("hipaa_");
 

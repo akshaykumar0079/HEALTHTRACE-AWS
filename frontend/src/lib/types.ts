@@ -1,7 +1,7 @@
 /** Wire types for the HEALTH TRACE backend (backend/app/api, backend/app/models.py). */
 
 export type Severity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
-export type IncidentState = "OPEN" | "ACKNOWLEDGED" | "RESOLVED";
+export type IncidentState = "OPEN" | "ACKNOWLEDGED" | "INVESTIGATING" | "RESOLVED";
 export type AnomalyKind =
   | "error_rate"
   | "latency_degradation"
@@ -80,6 +80,20 @@ export interface Incident {
   resolved_at: string | null;
   mttr_seconds: number | null;
   muted_until: string | null;
+  pinned: boolean;
+  pinned_at: string | null;
+  investigating_at: string | null;
+  /** Derived by the backend (incident_view). */
+  title: string;
+  source: string;
+  status_label: string;
+  severity: Severity;
+  occurrence_count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  /** The detector's own 0-100 score. null for rule-based (HIPAA) detections: never invented. */
+  risk_score: number | null;
+  risk_basis: string;
 }
 
 export type IncidentEventType =
@@ -87,9 +101,12 @@ export type IncidentEventType =
   | "alert_attached"
   | "escalated"
   | "acknowledged"
+  | "investigating"
   | "resolved"
   | "auto_resolved"
-  | "muted";
+  | "muted"
+  | "pinned"
+  | "unpinned";
 
 export interface IncidentEvent {
   id: number | null;
@@ -184,10 +201,133 @@ export type LiveMessage =
   | ({ type: "replay" } & ReplayStatus)
   | { type: "heartbeat"; ts: string };
 
+export interface EvidenceItem {
+  id: number;
+  alert_id: number | null;
+  ts: string;
+  record: Record<string, string | number | boolean | null>;
+}
+
+export interface IncidentSearchResult {
+  items: Incident[];
+  total: number;
+  limit: number;
+  offset: number;
+  sort: string;
+  order: string;
+}
+
+export interface IncidentSearchParams {
+  status?: string;
+  severity?: string;
+  pinned?: boolean;
+  since_hours?: number;
+  q?: string;
+  sort?: string;
+  order?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+}
+
+export interface IncidentSummary {
+  active: number;
+  pinned: number;
+  resolved: number;
+  total: number;
+  by_severity: Record<Severity, number>;
+  by_status: Record<IncidentState, number>;
+  unacknowledged_high: number;
+  resolved_last_24h: number;
+  mean_time_to_resolve_seconds: number | null;
+  generated_at: string;
+}
+
+export interface ActivityItem {
+  id: number;
+  incident_id: number;
+  ts: string;
+  event_type: IncidentEventType;
+  severity: Severity | null;
+  detail: string | null;
+  title: string;
+}
+
+export interface SystemStatus {
+  backend: "ok";
+  environment: string;
+  database: { dialect: "sqlite" | "postgres"; ok: boolean; error: string | null; write_errors: number; last_write_error: string | null };
+  stream: { state: "live" | "stale" | "replaying"; event_lag_seconds: number | null; ws_clients: number };
+  data_source: "simulated" | "real";
+  simulated_data: boolean;
+  operator_auth: { required: boolean; configured: boolean };
+  generated_at: string;
+}
+
+export interface NotificationAttempt {
+  id: number;
+  ts: string;
+  channel: string;
+  kind: string;
+  provider: string;
+  status: "accepted" | "failed" | "skipped";
+  incident_id: number | null;
+  severity: Severity | null;
+  provider_message_id: string | null;
+  detail: string | null;
+}
+
+export interface NotificationSettingsView {
+  settings: {
+    enabled: boolean;
+    recipients: string[];
+    min_severity: "HIGH" | "CRITICAL";
+    cooldown_seconds: number;
+    updated_at: string | null;
+    updated_by: string | null;
+  };
+  provider: { name: "smtp" | "brevo"; configured: boolean; missing: string[]; sender: string | null; secret_configured: boolean };
+  status: {
+    sent: number;
+    failed: number;
+    skipped: number;
+    retries: number;
+    last_success_at: string | null;
+    last_failure_at: string | null;
+    last_error: string | null;
+    queue_depth: number;
+    sent_last_hour: number;
+    max_per_hour: number;
+    last_provider_message_id: string | null;
+    delivery_confirmed: boolean;
+    delivery_note: string;
+    config_warnings: string[];
+  };
+  attempts: NotificationAttempt[];
+  allowed_min_severities: ("HIGH" | "CRITICAL")[];
+  warnings?: string[];
+}
+
+export interface NotificationSettingsInput {
+  enabled: boolean;
+  recipients: string[];
+  min_severity: "HIGH" | "CRITICAL";
+  cooldown_seconds: number;
+}
+
+export interface TestEmailResult {
+  ok: boolean;
+  result: "accepted_by_provider" | "failed";
+  provider: string;
+  provider_message_id: string | null;
+  error: string | null;
+  note: string | null;
+}
+
 export interface IncidentDetail {
   incident: Incident;
   events: IncidentEvent[];
   alerts: Alert[];
+  evidence: EvidenceItem[];
   detection: DetectionRule;
 }
 
@@ -325,13 +465,33 @@ export interface ChannelStatus {
   recent: { ts: string; outcome: "sent" | "failed" | "skipped"; subject: string; error: string | null }[];
 }
 
+export type AwsIntegrationLabel = "MOCK" | "NOT CONFIGURED" | "CONFIGURED" | "ERROR";
+
 export interface AwsStatus {
+  integration: { status: AwsIntegrationLabel; verified: boolean; calls_aws: boolean; detail: string; problems?: string[] };
+  requirement_note: string;
   mode: "off" | "mock" | "live";
   region: string;
-  cloudwatch: { log_group: string } & ChannelStatus;
+  cloudwatch: { log_group: string; log_stream?: string } & ChannelStatus;
   sns: { topic_arn: string | null; configured: boolean } & ChannelStatus;
   queue_depth: number;
+  config_warnings?: string[];
   credentials_source: string | null;
+}
+
+export interface EmailStatus extends ChannelStatus {
+  enabled: boolean;
+  provider?: "smtp" | "brevo";
+  configured: boolean;
+  missing: string[];
+  host: string;
+  port: number;
+  use_tls: boolean;
+  sender: string | null;
+  recipients: string[];
+  severities: string[];
+  queue_depth: number;
+  config_warnings: string[];
 }
 
 export interface AwsCheckResult {

@@ -14,6 +14,7 @@ import {
 import { api, getOperatorToken } from "@/lib/api";
 import { reconnectNow, useLive } from "@/lib/live";
 import { Beacon, SeverityBadge, cx } from "@/components/ui";
+import { SimulatedBadge, useFreshness } from "@/components/StatusStrip";
 import { SIGNAL_HEX, ago, subjectOf, KIND_LABEL } from "@/lib/format";
 
 const menuContent =
@@ -24,13 +25,16 @@ const menuItem =
 export function ConnectionPill() {
   const connection = useLive((s) => s.connection);
   const replay = useLive((s) => s.replay);
+  const freshness = useFreshness();
   const replaying = replay?.active;
 
   const meta =
     connection === "live"
       ? replaying
         ? { label: `REPLAYING ${Math.round((replay?.progress ?? 0) * 100)}%`, color: "#e3b35a", detail: "Catching up on log history" }
-        : { label: "LIVE", color: SIGNAL_HEX, detail: "WebSocket connected" }
+        : freshness === "stale"
+          ? { label: "STALE", color: "#e3b35a", detail: "Connected, but no recent log events are arriving" }
+          : { label: "LIVE", color: SIGNAL_HEX, detail: "Connected and events are flowing" }
       : connection === "connecting"
         ? { label: "CONNECTING", color: "#627085", detail: "Opening WebSocket" }
         : connection === "reconnecting"
@@ -44,7 +48,7 @@ export function ConnectionPill() {
       className="flex h-8 items-center gap-2 rounded-full bg-ink-800 pl-3 pr-3.5 shadow-[inset_0_0_0_1px_var(--hairline)]"
       aria-live="polite"
     >
-      <Beacon color={meta.color} pulse={connection === "live" || connection === "reconnecting"} size={7} />
+      <Beacon color={meta.color} pulse={connection === "live" && freshness === "live"} size={7} />
       <span className="font-mono text-[10.5px] font-medium tracking-[0.12em]" style={{ color: meta.color }}>
         {meta.label}
       </span>
@@ -67,7 +71,7 @@ function ContextSelector() {
           <span className="block truncate text-[12.5px] font-medium leading-tight text-fg">{project}</span>
           <span className="block font-mono text-[10.5px] leading-tight text-fg-dim">{env}</span>
         </span>
-        <CaretUpDown size={13} className="text-fg-dim" />
+        <CaretUpDown size={13} className="text-fg-dim max-sm:hidden" />
       </Dropdown.Trigger>
       <Dropdown.Portal>
         <Dropdown.Content sideOffset={8} align="start" className={menuContent}>
@@ -86,9 +90,6 @@ function ContextSelector() {
             <Info size={14} className="mt-0.5 shrink-0" />
             Each deployment monitors one project and environment. Set PROJECT_NAME and ENVIRONMENT per deployment.
           </div>
-          <Dropdown.Item asChild className={menuItem}>
-            <Link to="/app/projects">Open projects</Link>
-          </Dropdown.Item>
         </Dropdown.Content>
       </Dropdown.Portal>
     </Dropdown.Root>
@@ -119,7 +120,7 @@ function Notifications() {
             <Dropdown.Item
               key={`${a.id}-${a.ts}`}
               className={cx(menuItem, "items-start")}
-              onSelect={() => a.incident_id && navigate(`/app/anomalies/${a.incident_id}`)}
+              onSelect={() => a.incident_id && navigate(`/app/incidents/${a.incident_id}`)}
             >
               <SeverityBadge severity={a.severity} size="sm" />
               <span className="min-w-0 flex-1">
@@ -155,7 +156,7 @@ function UserMenu() {
           <div className="px-2.5 pb-2 pt-1.5">
             <p className="text-[13px] font-medium text-fg">Operator console</p>
             <p className="mt-0.5 text-[11.5px] leading-relaxed text-fg-dim">
-              Sign-in is handled in front of the app (e.g. ALB with Cognito). {hasToken ? "An operator token is set for this tab." : "No operator token set."}
+              Without a token you have a read-only view. {hasToken ? "An operator token is set for this tab." : "No operator token set."}
             </p>
           </div>
           <Dropdown.Separator className="my-1 h-px bg-[var(--hairline)]" />
@@ -183,9 +184,10 @@ export function Topbar({ onMenu, onSearch }: { onMenu: () => void; onSearch: () 
       >
         <List size={20} />
       </button>
-      <ContextSelector />
+      <div className="max-sm:hidden"><ContextSelector /></div>
       <div className="mx-1 hidden h-5 w-px bg-[var(--hairline-strong)] md:block" />
       <ConnectionPill />
+      <SimulatedBadge />
       <div className="flex-1" />
       <button
         onClick={onSearch}

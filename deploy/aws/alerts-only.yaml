@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  HEALTH TRACE alert destinations only (no ECS, no VPC, no load balancer):
+  the CloudWatch log group and SNS topic the app writes to, plus two
+  least-privilege managed policies to attach to whoever runs the app or the
+  live check. For running HEALTH TRACE on a laptop with AWS_MODE=live.
+  Deleting this stack removes exactly these resources and nothing else.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: local
+    AllowedPattern: "[a-z0-9-]+"
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to the topic (AWS sends a confirmation link first).
+  RetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub healthtrace-alerts-${EnvironmentName}
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /healthtrace/${EnvironmentName}/alerts
+      RetentionInDays: !Ref RetentionInDays
+
+  # What the running app needs (see docs/aws-iam.md).
+  AppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: HEALTH TRACE app - write alerts to its log group, publish to its topic.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WriteAlertLogs
+            Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource:
+              - !GetAtt AlertLogGroup.Arn
+              - !Sub "${AlertLogGroup.Arn}:*"
+          - Sid: TestConnectionCheck
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: "*"
+          - Sid: PublishAlerts
+            Effect: Allow
+            Action: [sns:Publish, sns:GetTopicAttributes]
+            Resource: !Ref AlertTopic
+
+  # Extra read access only scripts/aws_live_check.py needs, to read the
+  # alerts back and confirm they arrived. The app itself never reads logs.
+  VerifierPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: HEALTH TRACE live check - read alerts back from its log group.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadAlertLogs
+            Effect: Allow
+            Action: [logs:FilterLogEvents, logs:GetLogEvents]
+            Resource:
+              - !GetAtt AlertLogGroup.Arn
+              - !Sub "${AlertLogGroup.Arn}:*"
+
+Outputs:
+  LogGroupName:
+    Value: !Ref AlertLogGroup
+  SnsTopicArn:
+    Value: !Ref AlertTopic
+  AppPolicyArn:
+    Value: !Ref AppPolicy
+  VerifierPolicyArn:
+    Value: !Ref VerifierPolicy

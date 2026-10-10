@@ -66,7 +66,7 @@ function Verdict() {
         <p className="mt-3 max-w-[48ch] text-[13.5px] leading-relaxed text-fg-muted">{detail}</p>
         {worst && (
           <Link
-            to={`/app/anomalies/${worst.id}`}
+            to={`/app/incidents/${worst.id}`}
             className="group mt-5 inline-flex items-center gap-2 rounded-full py-1.5 pl-4 pr-1.5 text-[13px] font-medium text-ink-950 transition-transform active:scale-[0.98]"
             style={{ background: color }}
           >
@@ -166,7 +166,7 @@ function ActiveAnomalies() {
         title="Active anomalies"
         description={active.length ? "Ranked by peak severity." : undefined}
         actions={
-          <Link to="/app/anomalies" className="text-[12px] font-medium text-fg-muted hover:text-signal">
+          <Link to="/app/incidents" className="text-[12px] font-medium text-fg-muted hover:text-signal">
             All anomalies
           </Link>
         }

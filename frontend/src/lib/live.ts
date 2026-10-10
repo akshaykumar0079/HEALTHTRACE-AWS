@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api } from "./api";
+import { api, wsUrl } from "./api";
 import type {
   Alert,
   Health,
@@ -35,6 +35,7 @@ export interface Pulse {
 const SERIES_CAP = 17280; // 24h of 5s windows per service
 const ALERT_CAP = 400;
 const LOG_CAP = 600;
+const PAUSED_CAP = 600; // events held back while the feed is paused; oldest are dropped past this
 const HISTORY_MINUTES = 60;
 
 interface LiveState {
@@ -49,6 +50,11 @@ interface LiveState {
   incidents: Record<number, Incident>;
   logs: LogRecord[];
   logsPaused: boolean;
+  /** Events that arrived while paused (newest first), shown as "N new events" and flushed on resume. */
+  pausedBuffer: LogRecord[];
+  pausedDropped: number;
+  /** Bumped on every incident_update so list pages can refresh without polling. */
+  incidentVersion: number;
   health: Health | null;
   replay: ReplayStatus | null;
   pulses: Pulse[];
@@ -68,10 +74,19 @@ export const useLive = create<LiveState>((set) => ({
   incidents: {},
   logs: [],
   logsPaused: false,
+  pausedBuffer: [],
+  pausedDropped: 0,
+  incidentVersion: 0,
   health: null,
   replay: null,
   pulses: [],
-  setLogsPaused: (paused) => set({ logsPaused: paused }),
+  setLogsPaused: (paused) =>
+    set((s) => {
+      if (paused) return { logsPaused: true };
+      // Resume: merge what was held back so nothing is lost, then clear the buffer.
+      const logs = [...s.pausedBuffer, ...s.logs].slice(0, LOG_CAP);
+      return { logsPaused: false, logs, pausedBuffer: [], pausedDropped: 0 };
+    }),
   upsertIncident: (incident) => set((s) => ({ incidents: { ...s.incidents, [incident.id]: incident } })),
 }));
 
@@ -161,17 +176,27 @@ function handle(message: LiveMessage): void {
     case "incident_update": {
       useLive.setState((s) => {
         const incidents = { ...s.incidents, [message.incident.id]: message.incident };
-        return { incidents, services: recomputeServiceIncidents(s.services, incidents) };
+        return {
+          incidents,
+          services: recomputeServiceIncidents(s.services, incidents),
+          incidentVersion: s.incidentVersion + 1,
+        };
       });
       return;
     }
     case "logs": {
-      if (useLive.getState().logsPaused) return;
       // A batch can overlap the tail already delivered in a snapshot.
       useLive.setState((s) => {
-        const newest = s.logs[0]?.seq ?? 0;
+        const newest = s.pausedBuffer[0]?.seq ?? s.logs[0]?.seq ?? 0;
         const fresh = message.events.filter((e) => e.seq > newest).reverse();
-        return fresh.length ? { logs: [...fresh, ...s.logs].slice(0, LOG_CAP) } : {};
+        if (!fresh.length) return {};
+        if (s.logsPaused) {
+          // Paused: hold events back (bounded) instead of dropping them.
+          const merged = [...fresh, ...s.pausedBuffer];
+          const dropped = Math.max(0, merged.length - PAUSED_CAP);
+          return { pausedBuffer: merged.slice(0, PAUSED_CAP), pausedDropped: s.pausedDropped + dropped };
+        }
+        return { logs: [...fresh, ...s.logs].slice(0, LOG_CAP) };
       });
       return;
     }
@@ -254,11 +279,7 @@ let watchdog: number | undefined;
 let healthTimer: number | undefined;
 let started = false;
 const WATCHDOG_MS = 25000;
-
-function socketUrl(): string {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws`;
-}
+export const STALE_AFTER_SECONDS = 30;
 
 function armWatchdog(): void {
   window.clearTimeout(watchdog);
@@ -267,13 +288,14 @@ function armWatchdog(): void {
 
 function connect(): void {
   window.clearTimeout(retryTimer);
-  const ws = new WebSocket(socketUrl());
+  const ws = new WebSocket(wsUrl());
   socket = ws;
   ws.onopen = () => {
     useLive.setState({ connection: "live", attempts: 0 });
     armWatchdog();
   };
   ws.onmessage = (event) => {
+    if (socket !== ws) return; // a superseded socket must not write state (no duplicate subscriptions)
     armWatchdog();
     useLive.setState({ lastMessageAt: Date.now() });
     try {
@@ -329,7 +351,26 @@ export function stopLive(): void {
 export const activeIncidents = (incidents: Record<number, Incident>) =>
   Object.values(incidents)
     .filter((i) => i.state !== "RESOLVED")
-    .sort((a, b) => SEVERITY_ORDER[b.peak_severity] - SEVERITY_ORDER[a.peak_severity] || b.opened_at.localeCompare(a.opened_at));
+    .sort(
+      (a, b) =>
+        SEVERITY_ORDER[b.peak_severity] - SEVERITY_ORDER[a.peak_severity] ||
+        (b.risk_score ?? -1) - (a.risk_score ?? -1) ||
+        b.last_seen_at.localeCompare(a.last_seen_at),
+    );
+
+export type DataFreshness = "live" | "stale" | "replaying" | "disconnected" | "connecting";
+
+/**
+ * "Live" means events are actually flowing, not just that the socket is open:
+ * a connected socket whose log source has gone quiet is "stale".
+ */
+export function dataFreshness(connection: ConnectionState, health: Health | null, replaying: boolean): DataFreshness {
+  if (connection === "connecting") return "connecting";
+  if (connection !== "live") return "disconnected";
+  if (replaying) return "replaying";
+  const lag = health?.event_lag_seconds;
+  return lag == null || lag > STALE_AFTER_SECONDS ? "stale" : "live";
+}
 
 export function systemSeverity(incidents: Record<number, Incident>): Severity | null {
   return activeIncidents(incidents)[0]?.peak_severity ?? null;

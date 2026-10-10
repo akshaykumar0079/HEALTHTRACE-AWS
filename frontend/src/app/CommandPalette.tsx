@@ -8,7 +8,7 @@ import { Broadcast, Graph, Lightning, MagnifyingGlass, PaperPlaneTilt, Terminal,
 import { NAV } from "./nav";
 import { api } from "@/lib/api";
 import { activeIncidents, useLive } from "@/lib/live";
-import { KIND_LABEL, serviceLabel, subjectOf } from "@/lib/format";
+import { serviceLabel } from "@/lib/format";
 import { SeverityBadge } from "@/components/ui";
 import { toast } from "./toast";
 
@@ -133,17 +133,17 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
                       </Command.Group>
 
                       {active.length > 0 && (
-                        <Command.Group heading="Active anomalies" className={groupHeading}>
+                        <Command.Group heading="Active incidents" className={groupHeading}>
                           {active.map((inc) => (
                             <Command.Item
                               key={inc.id}
-                              value={`anomaly ${inc.id} ${subjectOf(inc)} ${KIND_LABEL[inc.kind]}`}
-                              onSelect={() => go(`/app/anomalies/${inc.id}`)}
+                              value={`incident ${inc.id} ${inc.title}`}
+                              onSelect={() => go(`/app/incidents/${inc.id}`)}
                               className={itemClass}
                             >
                               <Waveform size={16} />
                               <span className="flex-1 truncate">
-                                {subjectOf(inc)}: {KIND_LABEL[inc.kind]}
+                                {inc.title}
                               </span>
                               <SeverityBadge severity={inc.peak_severity} size="sm" />
                             </Command.Item>
@@ -173,9 +173,6 @@ export function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenCh
                         </Command.Item>
                         <Command.Item value="send aws test alert cloudwatch sns" onSelect={() => run(() => testAlert.mutate())} className={itemClass}>
                           <PaperPlaneTilt size={16} /> Send AWS test alert
-                        </Command.Item>
-                        <Command.Item value="switch environment project" onSelect={() => go("/app/projects")} className={itemClass}>
-                          <Graph size={16} /> Switch environment
                         </Command.Item>
                       </Command.Group>
 

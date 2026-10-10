@@ -113,11 +113,16 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # No logs:CreateLogGroup: this stack creates AlertLogGroup, and the
+              # app treats AccessDenied on CreateLogGroup as "pre-created".
+              # Streams are created by the app (one per UTC day by default).
               - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogGroups]
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource:
                   - !GetAtt AlertLogGroup.Arn
                   - !Sub "${AlertLogGroup.Arn}:*"
+              # Only for the AWS page's read-only "test connection" check;
+              # DescribeLogGroups does not support resource-level scoping.
               - Effect: Allow
                 Action: logs:DescribeLogGroups
                 Resource: "*"

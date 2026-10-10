@@ -3,6 +3,7 @@ and that processing an event actually flows through to storage."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config import Settings, load_config
@@ -61,13 +62,18 @@ async def test_processing_an_app_line_updates_service_state_and_persists_metrics
     pipeline = Pipeline(settings, load_config())
     await pipeline.store.connect()
     try:
+        # Relative to now: list_metrics only returns the last N minutes, so a
+        # fixed date here made this test fail once that date passed.
+        t0 = (datetime.now(timezone.utc) - timedelta(minutes=5)).replace(second=0, microsecond=0)
+        ts1 = t0.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        ts2 = (t0 + timedelta(seconds=6)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         line1 = (
-            '{"ts":"2026-09-28T12:00:00.000Z","type":"app","service":"claims","level":"INFO",'
+            '{"ts":"' + ts1 + '","type":"app","service":"claims","level":"INFO",'
             '"priority":"routine","request_id":"X-1","patient_id":"P-000001","status":200,'
             '"latency_ms":100,"msg":"ok"}'
         )
         line2 = (
-            '{"ts":"2026-09-28T12:00:06.000Z","type":"app","service":"claims","level":"INFO",'
+            '{"ts":"' + ts2 + '","type":"app","service":"claims","level":"INFO",'
             '"priority":"routine","request_id":"X-2","patient_id":"P-000002","status":200,'
             '"latency_ms":100,"msg":"ok"}'
         )

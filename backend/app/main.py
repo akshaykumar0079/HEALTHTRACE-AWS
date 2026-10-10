@@ -4,13 +4,15 @@ the REST + WebSocket API, and (when built) the frontend on the same origin."""
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router as api_router
@@ -19,6 +21,8 @@ from app.config import AppConfig, Settings, get_settings, load_config
 from app.pipeline import Pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+_WRITE_LIMIT_PER_MIN = 120
 
 _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -36,11 +40,24 @@ def create_app(settings: Optional[Settings] = None, config: Optional[AppConfig] 
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        generator = None
+        if settings.embedded_generator:
+            from app.embedded_generator import EmbeddedGenerator
+            from app.config import REPO_ROOT
+
+            generator = EmbeddedGenerator(
+                log_dir=settings.log_dir, control_file=settings.control_file, root=REPO_ROOT,
+                rate=settings.embedded_rate, backfill_hours=settings.embedded_backfill_hours,
+            )
+            # Backfill first so the baseline has history before the pipeline tails.
+            await generator.start()
         await pipeline.start()
         try:
             yield
         finally:
             await pipeline.stop()
+            if generator is not None:
+                await generator.stop()
 
     app = FastAPI(title="HEALTH TRACE (MedGuard engine)", lifespan=lifespan)
     app.state.pipeline = pipeline
@@ -49,8 +66,28 @@ def create_app(settings: Optional[Settings] = None, config: Optional[AppConfig] 
     if origins:
         app.add_middleware(
             CORSMiddleware, allow_origins=origins, allow_credentials=False,
-            allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-Operator-Token"],
+            allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type", "X-Operator-Token"],
         )
+
+    # Minimal in-memory limiter for state-changing calls (per client IP).
+    # Hosted single instance only; a real deployment would limit at the edge.
+    hits: dict[str, deque] = {}
+
+    @app.middleware("http")
+    async def rate_limit(request: Request, call_next):
+        if request.method in ("POST", "PUT", "DELETE", "PATCH") and request.url.path.startswith("/api/"):
+            ip = request.client.host if request.client else "?"
+            now = time.monotonic()
+            q = hits.setdefault(ip, deque())
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) >= _WRITE_LIMIT_PER_MIN:
+                return JSONResponse({"detail": "Too many requests; slow down."}, status_code=429,
+                                    headers={"Retry-After": "30"})
+            q.append(now)
+            if len(hits) > 5000:
+                hits.clear()
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):

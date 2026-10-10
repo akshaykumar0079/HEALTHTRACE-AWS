@@ -7,9 +7,12 @@ import { useLive } from "@/lib/live";
 import { pct } from "@/lib/format";
 import { Button, ErrorState, Field, PageHeader, Panel, Skeleton, cx, inputClass } from "@/components/ui";
 import { toast } from "@/app/toast";
+import { NotificationSettings } from "@/components/NotificationSettings";
+import { AwsIntegration } from "@/components/AwsIntegration";
 
 const SECTIONS = [
   ["general", "General"],
+  ["notifications", "Notifications"],
   ["detection", "Detection"],
   ["baseline", "Baseline"],
   ["severity", "Severity"],
@@ -17,7 +20,7 @@ const SECTIONS = [
   ["realtime", "Real-time"],
   ["aws", "AWS"],
   ["access", "API access"],
-  ["notifications", "Notifications"],
+  ["routing", "Alert routing"],
 ] as const;
 
 function Section({ id, title, description, children }: { id: string; title: string; description?: string; children: ReactNode }) {
@@ -63,7 +66,7 @@ function OperatorToken({ required }: { required: boolean }) {
         label="Operator token"
         htmlFor="op-token"
         hint={required
-          ? "This backend requires a token for acknowledge, resolve, mute, demo and AWS test actions. It is kept in this tab's session storage only."
+          ? "This backend requires a token for pinning, status changes, notification settings, demo and AWS test actions. It is kept in this tab's session storage only."
           : "This backend does not require a token (OPERATOR_TOKEN is unset). Set one in production."}
       >
         <input
@@ -115,11 +118,11 @@ export default function Settings() {
 
   return (
     <div>
-      <PageHeader title="Settings" description="The configuration this backend is running with." />
+      <PageHeader title="Settings" description="Notifications you can change here; detection and deployment settings are shown read-only." />
       <div className="mb-5 flex gap-3 rounded-[14px] bg-ink-850 px-5 py-4 text-[12.5px] leading-relaxed text-fg-muted shadow-[inset_0_0_0_1px_var(--hairline)]">
         <Info size={17} className="mt-0.5 shrink-0 text-signal" />
         <p>
-          Detection settings come from <span className="font-mono text-fg">config.yaml</span> and deployment settings from environment variables, both read at startup. They are shown here read-only so the numbers you see are the numbers in force; change them in the repository and redeploy.
+          Notification settings below are editable and saved in the database. Detection settings come from <span className="font-mono text-fg">config.yaml</span> and deployment settings from environment variables, both read at startup. They are shown read-only so the numbers you see are the numbers in force.
         </p>
       </div>
       <div className="grid gap-8 lg:grid-cols-[180px_minmax(0,1fr)]">
@@ -147,6 +150,9 @@ export default function Settings() {
               ["Environment", dep.environment, "ENVIRONMENT"],
               ["Demo scenarios", dep.demo_mode ? "enabled" : "disabled", "DEMO_MODE: enables scenario injection from the dashboard"],
             ]} />
+          </Section>
+          <Section id="notifications" title="Notifications" description="Email alerts for serious incidents. Changes apply immediately and are kept across restarts.">
+            <NotificationSettings />
           </Section>
           <Section id="detection" title="Detection" description="Every service gets a sliding window over event time; each window is compared with its baseline.">
             <Rows rows={[
@@ -193,15 +199,16 @@ export default function Settings() {
             ]} />
           </Section>
           <Section id="aws" title="AWS">
+            <AwsIntegration />
             <Rows rows={[
               ["Mode", dep.aws_mode, "AWS_MODE: off, mock or live"],
-              ["Details", "see the AWS page", "region, log group, topic and delivery status"],
+              ["Details", "see the AWS integration page", "region, log group, topic and delivery status"],
             ]} />
           </Section>
           <Section id="access" title="API access" description="Read endpoints are open to anyone who can reach the app; put sign-in (ALB with Cognito) in front of it in production.">
             <OperatorToken required={dep.operator_token_required} />
           </Section>
-          <Section id="notifications" title="Notifications">
+          <Section id="routing" title="Alert routing" description="How detections reach AWS. Email is configured under Notifications above.">
             <Rows rows={[
               ["CloudWatch Logs", "every alert"],
               ["SNS", "HIGH and CRITICAL", "on anomaly open and on escalation"],

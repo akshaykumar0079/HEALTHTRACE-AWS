@@ -98,6 +98,7 @@ class AwsNotifier:
         *,
         region: str = "us-east-1",
         log_group: str = "/medguard/alerts",
+        log_stream: str = "",
         sns_topic_arn: str = "",
         mock_log_path: Optional[Path] = None,
         max_attempts: int = MAX_ATTEMPTS,
@@ -106,6 +107,8 @@ class AwsNotifier:
         self.mode = mode
         self.region = region
         self.log_group = log_group
+        # Fixed stream name, or "" for one stream per UTC day (the original behaviour).
+        self.log_stream = log_stream
         self.sns_topic_arn = sns_topic_arn
         self.mock_log_path = mock_log_path
         self.max_attempts = max_attempts
@@ -116,9 +119,63 @@ class AwsNotifier:
         self._boto_logs_client = None
         self._boto_sns_client = None
         self._ensured_streams: set[str] = set()
+        self._create_group_denied_logged = False
         self.status: dict[Channel, ChannelStatus] = {"cloudwatch": ChannelStatus(), "sns": ChannelStatus()}
 
+    def config_warnings(self) -> list[str]:
+        """Misconfigurations worth surfacing before the first alert, not after it fails."""
+        if self.mode == "off":
+            return []
+        warnings: list[str] = []
+        if not self.sns_topic_arn:
+            warnings.append("SNS_TOPIC_ARN is not set: HIGH/CRITICAL incidents will not be published to SNS")
+        else:
+            parts = self.sns_topic_arn.split(":")
+            if len(parts) != 6 or parts[:3] != ["arn", "aws", "sns"]:
+                warnings.append(f"SNS_TOPIC_ARN does not look like an SNS topic ARN: {self.sns_topic_arn!r}")
+            elif parts[3] != self.region:
+                warnings.append(
+                    f"SNS_TOPIC_ARN is in region {parts[3]} but AWS_REGION is {self.region}: publishes will fail"
+                )
+        if not self.log_group:
+            warnings.append("CLOUDWATCH_LOG_GROUP is empty")
+        return warnings
+
+    def integration_status(self) -> dict[str, Any]:
+        """One honest label for the AWS integration, computed without any AWS call.
+
+        MOCK            AWS_MODE=mock: alerts go to a local file; AWS is not contacted.
+        NOT CONFIGURED  AWS_MODE=off (the default), or live with required settings missing.
+        CONFIGURED      AWS_MODE=live with settings present. Not proof that AWS accepts them:
+                        ``verified`` turns true only after a call succeeded in this process.
+        ERROR           AWS_MODE=live and the most recent calls failed with no success since.
+        """
+        cw, sns = self.status["cloudwatch"], self.status["sns"]
+        verified = bool(cw.sent or sns.sent)
+        if self.mode == "off":
+            return {"status": "NOT CONFIGURED", "verified": False, "calls_aws": False,
+                    "detail": "AWS integration is disabled (AWS_MODE=off). No AWS calls are made."}
+        if self.mode == "mock":
+            return {"status": "MOCK", "verified": False, "calls_aws": False,
+                    "detail": "Mock mode: alerts are written to a local file. No AWS calls are made and "
+                              "nothing is delivered to CloudWatch or SNS."}
+        problems = [w for w in self.config_warnings()]
+        if problems:
+            return {"status": "NOT CONFIGURED", "verified": False, "calls_aws": True, "detail": problems[0],
+                    "problems": problems}
+        last_fail = max((c.last_failure_at for c in (cw, sns) if c.last_failure_at), default=None)
+        last_ok = max((c.last_success_at for c in (cw, sns) if c.last_success_at), default=None)
+        if last_fail and (last_ok is None or last_fail > last_ok):
+            err = cw.last_error if cw.last_failure_at == last_fail else sns.last_error
+            return {"status": "ERROR", "verified": verified, "calls_aws": True,
+                    "detail": f"The latest AWS call failed: {err}"}
+        return {"status": "CONFIGURED", "verified": verified, "calls_aws": True,
+                "detail": ("AWS calls have succeeded in this session." if verified else
+                           "Settings are present but no AWS call has succeeded yet; run the connection test.")}
+
     async def start(self) -> None:
+        for warning in self.config_warnings():
+            logger.warning("notifier (AWS_MODE=%s): %s", self.mode, warning)
         if self.mode != "off" and self._worker_task is None:
             self._worker_task = asyncio.create_task(self._run())
 
@@ -208,21 +265,35 @@ class AwsNotifier:
     async def _send_cloudwatch(self, alert: Alert) -> None:
         if self.mode == "mock":
             self._append_mock(
-                {"aws_service": "cloudwatch_logs", "log_group": self.log_group, "alert": alert.model_dump(mode="json")}
+                {"aws_service": "cloudwatch_logs", "log_group": self.log_group,
+                 "log_stream": self._stream_for(alert.ts), "alert": alert.model_dump(mode="json")}
             )
             return
         await self._put_log_event(alert.ts, json.dumps(alert.model_dump(mode="json")))
 
+    def _stream_for(self, ts: datetime) -> str:
+        return self.log_stream or ts.strftime("%Y-%m-%d")
+
     async def _put_log_event(self, ts: datetime, message: str) -> None:
         client = self._logs_client()
-        stream = ts.strftime("%Y-%m-%d")
+        stream = self._stream_for(ts)
         await asyncio.to_thread(self._ensure_log_stream, client, stream)
-        await asyncio.to_thread(
-            client.put_log_events,
+        kwargs = dict(
             logGroupName=self.log_group,
             logStreamName=stream,
             logEvents=[{"timestamp": int(ts.timestamp() * 1000), "message": message}],
         )
+        try:
+            await asyncio.to_thread(client.put_log_events, **kwargs)
+        except Exception as exc:
+            if _aws_error_code(exc) != "ResourceNotFoundException":
+                raise
+            # The group or stream was deleted after we cached it as existing:
+            # forget it, recreate, and try once more (the outer retry loop
+            # still covers anything that fails after this).
+            self._ensured_streams.discard(stream)
+            await asyncio.to_thread(self._ensure_log_stream, client, stream)
+            await asyncio.to_thread(client.put_log_events, **kwargs)
 
     async def _send_sns(self, incident: Incident, explanation: str) -> None:
         target = incident.service or incident.user_id or "unknown"
@@ -349,10 +420,30 @@ class AwsNotifier:
             return
         try:
             client.create_log_group(logGroupName=self.log_group)
-        except client.exceptions.ResourceAlreadyExistsException:
-            pass
+        except Exception as exc:
+            code = _aws_error_code(exc)
+            if code == "AccessDeniedException":
+                # Least-privilege roles (e.g. the CloudFormation task role) may
+                # not hold logs:CreateLogGroup because the group is created
+                # for them. Carry on: if the group really is missing,
+                # create_log_stream below fails with a clear ResourceNotFound.
+                if not self._create_group_denied_logged:
+                    logger.info("notifier: no logs:CreateLogGroup permission; assuming %s is pre-created",
+                                self.log_group)
+                    self._create_group_denied_logged = True
+            elif code != "ResourceAlreadyExistsException":
+                raise
         try:
             client.create_log_stream(logGroupName=self.log_group, logStreamName=stream)
-        except client.exceptions.ResourceAlreadyExistsException:
-            pass
+        except Exception as exc:
+            if _aws_error_code(exc) != "ResourceAlreadyExistsException":
+                raise
         self._ensured_streams.add(stream)
+
+
+def _aws_error_code(exc: BaseException) -> Optional[str]:
+    """The AWS error code of a botocore ClientError (None for anything else)."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return response.get("Error", {}).get("Code")
+    return None

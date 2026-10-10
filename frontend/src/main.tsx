@@ -1,6 +1,6 @@
 import { StrictMode, lazy } from "react";
 import { createRoot } from "react-dom/client";
-import { createBrowserRouter, RouterProvider } from "react-router";
+import { Navigate, createBrowserRouter, RouterProvider, useParams } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
@@ -9,9 +9,13 @@ import AppShell from "./app/AppShell";
 import { RouteError } from "./app/RouteError";
 
 const Landing = lazy(() => import("./pages/Landing"));
-const Dashboard = lazy(() => import("./pages/Dashboard"));
+const Overview = lazy(() => import("./pages/Overview"));
+const Incidents = lazy(() => import("./pages/Incidents"));
+const Pinned = lazy(() => import("./pages/Pinned"));
+const History = lazy(() => import("./pages/History"));
+const LiveEvents = lazy(() => import("./pages/LiveEvents"));
+const Pulse = lazy(() => import("./pages/Dashboard"));
 const Monitor = lazy(() => import("./pages/Monitor"));
-const Anomalies = lazy(() => import("./pages/Anomalies"));
 const Investigation = lazy(() => import("./pages/Investigation"));
 const Alerts = lazy(() => import("./pages/Alerts"));
 const Logs = lazy(() => import("./pages/Logs"));
@@ -19,9 +23,12 @@ const Analytics = lazy(() => import("./pages/Analytics"));
 const Services = lazy(() => import("./pages/Services"));
 const ServiceDetail = lazy(() => import("./pages/ServiceDetail"));
 const Aws = lazy(() => import("./pages/Aws"));
-const Projects = lazy(() => import("./pages/Projects"));
-const Team = lazy(() => import("./pages/Team"));
 const Settings = lazy(() => import("./pages/Settings"));
+
+function LegacyIncidentRedirect() {
+  const { id } = useParams();
+  return <Navigate to={`/app/incidents/${id ?? ""}`} replace />;
+}
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -36,18 +43,23 @@ const router = createBrowserRouter([
     element: <AppShell />,
     errorElement: <RouteError />,
     children: [
-      { index: true, element: <Dashboard /> },
+      { index: true, element: <Overview /> },
+      { path: "incidents", element: <Incidents /> },
+      { path: "incidents/:id", element: <Investigation /> },
+      { path: "pinned", element: <Pinned /> },
+      { path: "history", element: <History /> },
+      { path: "events", element: <LiveEvents /> },
+      { path: "pulse", element: <Pulse /> },
       { path: "monitor", element: <Monitor /> },
-      { path: "anomalies", element: <Anomalies /> },
-      { path: "anomalies/:id", element: <Investigation /> },
+      // Older links and bookmarks.
+      { path: "anomalies", element: <Navigate to="/app/incidents" replace /> },
+      { path: "anomalies/:id", element: <LegacyIncidentRedirect /> },
       { path: "alerts", element: <Alerts /> },
       { path: "logs", element: <Logs /> },
       { path: "analytics", element: <Analytics /> },
       { path: "services", element: <Services /> },
       { path: "services/:name", element: <ServiceDetail /> },
       { path: "aws", element: <Aws /> },
-      { path: "projects", element: <Projects /> },
-      { path: "team", element: <Team /> },
       { path: "settings", element: <Settings /> },
     ],
   },

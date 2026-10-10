@@ -1,11 +1,7 @@
-"""SQLite persistence, aiosqlite-backed (SPEC.md section 6.10).
-
-The full schema is created now so it's stable across milestones. Milestone 3
-only exercises the ``baselines`` table (EWMA persistence: SPEC.md 6.4 —
-"every 60 seconds and on shutdown, reload on startup"). The other tables get
-their read/write methods in Milestone 4 (incidents, access_stats) and
-Milestone 5 (metrics history, alerts).
-"""
+"""Persistence (SPEC.md section 6.10) over SQLite locally or PostgreSQL when
+``DATABASE_URL`` is set. Statements are written once with ``?`` placeholders;
+``app.store.database`` adapts them per engine and ``app.store.migrations``
+owns the schema (versioned, additive, never destructive)."""
 
 from __future__ import annotations
 
@@ -13,105 +9,11 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
-
-import aiosqlite
+from typing import Any, Optional
 
 from app.models import Alert, Incident, IncidentEvent, WindowMetrics
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    service TEXT NOT NULL,
-    window_end TEXT NOT NULL,
-    total INTEGER NOT NULL,
-    errors INTEGER NOT NULL,
-    error_rate REAL NOT NULL,
-    p95_latency_ms REAL NOT NULL,
-    urgent_errors INTEGER NOT NULL,
-    affected_patients_urgent INTEGER NOT NULL,
-    affected_patients_routine INTEGER NOT NULL,
-    malformed_lines INTEGER NOT NULL DEFAULT 0,
-    baseline_mean REAL,
-    baseline_std REAL
-);
-CREATE INDEX IF NOT EXISTS idx_metrics_service_ts ON metrics(service, window_end);
-
-CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    service TEXT,
-    user_id TEXT,
-    severity TEXT NOT NULL,
-    score REAL NOT NULL,
-    explanation TEXT NOT NULL,
-    metrics_json TEXT NOT NULL DEFAULT '{}',
-    incident_id INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
-CREATE INDEX IF NOT EXISTS idx_alerts_service ON alerts(service);
-
-CREATE TABLE IF NOT EXISTS incidents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    service TEXT,
-    user_id TEXT,
-    state TEXT NOT NULL,
-    peak_severity TEXT NOT NULL,
-    alert_count INTEGER NOT NULL DEFAULT 1,
-    opened_at TEXT NOT NULL,
-    acknowledged_at TEXT,
-    resolved_at TEXT,
-    mttr_seconds REAL
-);
-CREATE INDEX IF NOT EXISTS idx_incidents_fingerprint ON incidents(fingerprint);
-CREATE INDEX IF NOT EXISTS idx_incidents_state ON incidents(state);
-
-CREATE TABLE IF NOT EXISTS incident_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id INTEGER NOT NULL,
-    ts TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    severity TEXT,
-    detail TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_incident_events_incident ON incident_events(incident_id);
-
--- hour_of_day = -1 is the global per-service fallback baseline (SPEC.md 6.4),
--- used before an (service, hour_of_day) bucket has warmed up.
-CREATE TABLE IF NOT EXISTS baselines (
-    service TEXT NOT NULL,
-    hour_of_day INTEGER NOT NULL,
-    metric TEXT NOT NULL,
-    mean REAL NOT NULL,
-    variance REAL NOT NULL,
-    count INTEGER NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (service, hour_of_day, metric)
-);
-
--- Byte position of each tailed log file, saved together with the baselines so
--- a restart resumes exactly where the learned state left off.
-CREATE TABLE IF NOT EXISTS tail_positions (
-    path TEXT PRIMARY KEY,
-    file_id INTEGER,
-    offset INTEGER NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS access_stats (
-    user_id TEXT NOT NULL,
-    metric TEXT NOT NULL,
-    mean REAL NOT NULL,
-    variance REAL NOT NULL,
-    count INTEGER NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (user_id, metric)
-);
-"""
-
+from app.store.database import Database, create_database
+from app.store.migrations import migrate
 
 @dataclass
 class BaselineRow:
@@ -124,39 +26,35 @@ class BaselineRow:
 
 
 class Store:
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, database_url: Optional[str] = None) -> None:
         self.db_path = Path(db_path)
-        self._conn: Optional[aiosqlite.Connection] = None
+        self.database_url = database_url or None
+        self._db: Optional[Database] = None
         self._last_prune_cutoff: Optional[datetime] = None
 
     async def connect(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.db_path)
-        # WAL + NORMAL: commits no longer fsync, which is what capped the
-        # pipeline at ~100 writes/sec during replay and alert bursts.
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.execute("PRAGMA synchronous=NORMAL")
-        await self._conn.executescript(SCHEMA)
-        await self._migrate()
-        await self._conn.commit()
-
-    async def _migrate(self) -> None:
-        cursor = await self.conn.execute("PRAGMA table_info(metrics)")
-        columns = {row[1] for row in await cursor.fetchall()}
-        for column in ("baseline_mean", "baseline_std"):
-            if column not in columns:
-                await self.conn.execute(f"ALTER TABLE metrics ADD COLUMN {column} REAL")
+        db = create_database(self.db_path, self.database_url)
+        await db.connect()
+        self._db = db
+        await migrate(db)
 
     async def close(self) -> None:
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
 
     @property
-    def conn(self) -> aiosqlite.Connection:
-        if self._conn is None:
+    def conn(self) -> Database:
+        if self._db is None:
             raise RuntimeError("Store is not connected; call connect() first")
-        return self._conn
+        return self._db
+
+    @property
+    def dialect(self) -> str:
+        return self._db.dialect if self._db else "unconnected"
+
+    async def ping(self) -> None:
+        await self.conn.ping()
 
     # -- baselines (Milestone 3) --------------------------------------------
 
@@ -193,8 +91,8 @@ class Store:
     async def save_tail_position(self, path: str, file_id: Optional[int], offset: int) -> None:
         await self.conn.execute(
             """
-            INSERT INTO tail_positions (path, file_id, offset, updated_at) VALUES (?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id, offset=excluded.offset,
+            INSERT INTO tail_positions (path, file_id, "offset", updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id, "offset"=excluded."offset",
                                             updated_at=excluded.updated_at
             """,
             (path, file_id, offset, datetime.now(timezone.utc).isoformat()),
@@ -202,7 +100,7 @@ class Store:
         await self.conn.commit()
 
     async def load_tail_positions(self) -> dict[str, tuple[Optional[int], int]]:
-        cursor = await self.conn.execute("SELECT path, file_id, offset FROM tail_positions")
+        cursor = await self.conn.execute('SELECT path, file_id, "offset" FROM tail_positions')
         return {row[0]: (row[1], row[2]) for row in await cursor.fetchall()}
 
     async def load_baselines(self) -> list[BaselineRow]:
@@ -261,7 +159,7 @@ class Store:
     # -- alerts (Milestone 4) -------------------------------------------------
 
     async def save_alert(self, alert: Alert) -> int:
-        cursor = await self.conn.execute(
+        new_id = await self.conn.insert(
             """
             INSERT INTO alerts (ts, kind, service, user_id, severity, score, explanation, metrics_json, incident_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -272,8 +170,7 @@ class Store:
             ),
         )
         await self.conn.commit()
-        assert cursor.lastrowid is not None
-        return cursor.lastrowid
+        return new_id
 
     async def list_alerts(
         self,
@@ -303,45 +200,40 @@ class Store:
         rows = await cursor.fetchall()
         return [_row_to_alert(row) for row in rows]
 
-    # -- incidents (Milestone 4) -----------------------------------------------
+    # -- incidents ----------------------------------------------------------------
 
     async def upsert_incident(self, incident: Incident) -> None:
         await self.conn.execute(
             """
             INSERT INTO incidents
                 (id, fingerprint, kind, service, user_id, state, peak_severity, alert_count,
-                 opened_at, acknowledged_at, resolved_at, mttr_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 opened_at, acknowledged_at, resolved_at, mttr_seconds,
+                 pinned, pinned_at, investigating_at, last_seen_at, peak_score, muted_until)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 state=excluded.state, peak_severity=excluded.peak_severity, alert_count=excluded.alert_count,
                 acknowledged_at=excluded.acknowledged_at, resolved_at=excluded.resolved_at,
-                mttr_seconds=excluded.mttr_seconds
+                mttr_seconds=excluded.mttr_seconds, pinned=excluded.pinned, pinned_at=excluded.pinned_at,
+                investigating_at=excluded.investigating_at, last_seen_at=excluded.last_seen_at,
+                peak_score=excluded.peak_score, muted_until=excluded.muted_until
             """,
             (
                 incident.id, incident.fingerprint, incident.kind, incident.service, incident.user_id,
                 incident.state, incident.peak_severity, incident.alert_count, incident.opened_at.isoformat(),
                 _iso_or_none(incident.acknowledged_at), _iso_or_none(incident.resolved_at), incident.mttr_seconds,
+                1 if incident.pinned else 0, _iso_or_none(incident.pinned_at), _iso_or_none(incident.investigating_at),
+                _iso_or_none(incident.last_seen_at), incident.peak_score, _iso_or_none(incident.muted_until),
             ),
         )
         await self.conn.commit()
 
     async def get_incident(self, incident_id: int) -> Optional[Incident]:
-        cursor = await self.conn.execute(
-            """
-            SELECT id, fingerprint, kind, service, user_id, state, peak_severity, alert_count,
-                   opened_at, acknowledged_at, resolved_at, mttr_seconds
-            FROM incidents WHERE id = ?
-            """,
-            (incident_id,),
-        )
+        cursor = await self.conn.execute(f"SELECT {_INCIDENT_COLS} FROM incidents WHERE id = ?", (incident_id,))
         row = await cursor.fetchone()
         return _row_to_incident(row) if row else None
 
     async def list_incidents(self, *, state: Optional[str] = None, limit: Optional[int] = None) -> list[Incident]:
-        query = (
-            "SELECT id, fingerprint, kind, service, user_id, state, peak_severity, alert_count, "
-            "opened_at, acknowledged_at, resolved_at, mttr_seconds FROM incidents"
-        )
+        query = f"SELECT {_INCIDENT_COLS} FROM incidents"
         params: list[object] = []
         if state is not None:
             query += " WHERE state = ?"
@@ -353,6 +245,200 @@ class Store:
         cursor = await self.conn.execute(query, params)
         rows = await cursor.fetchall()
         return [_row_to_incident(row) for row in rows]
+
+    async def query_incidents(
+        self,
+        *,
+        states: Optional[list[str]] = None,
+        severities: Optional[list[str]] = None,
+        service: Optional[str] = None,
+        pinned: Optional[bool] = None,
+        kinds: Optional[list[str]] = None,
+        text: Optional[str] = None,
+        text_kinds: Optional[list[str]] = None,
+        incident_id: Optional[int] = None,
+        since: Optional[datetime] = None,
+        limit: int = 2000,
+    ) -> list[Incident]:
+        """Filtered incident search over persisted history. All values are bound
+        parameters; ``text`` is matched case-insensitively against service,
+        user id, fingerprint and (via ``text_kinds``) the human title."""
+        clauses: list[str] = []
+        params: list[object] = []
+
+        def in_clause(column: str, values: list[str]) -> None:
+            clauses.append(f"{column} IN ({','.join('?' for _ in values)})")
+            params.extend(values)
+
+        if states:
+            in_clause("state", states)
+        if severities:
+            in_clause("peak_severity", severities)
+        if kinds:
+            in_clause("kind", kinds)
+        if service:
+            clauses.append("service = ?")
+            params.append(service)
+        if pinned is not None:
+            clauses.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if since is not None:
+            clauses.append("COALESCE(last_seen_at, opened_at) >= ?")
+            params.append(since.isoformat())
+        if incident_id is not None:
+            clauses.append("id = ?")
+            params.append(incident_id)
+        if text:
+            like = f"%{_escape_like(text.lower())}%"
+            ors = [
+                "LOWER(COALESCE(service, '')) LIKE ? ESCAPE '\\'",
+                "LOWER(COALESCE(user_id, '')) LIKE ? ESCAPE '\\'",
+                "LOWER(fingerprint) LIKE ? ESCAPE '\\'",
+                "LOWER(kind) LIKE ? ESCAPE '\\'",
+            ]
+            params.extend([like] * 4)
+            if text_kinds:
+                ors.append(f"kind IN ({','.join('?' for _ in text_kinds)})")
+                params.extend(text_kinds)
+            clauses.append("(" + " OR ".join(ors) + ")")
+        query = f"SELECT {_INCIDENT_COLS} FROM incidents"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY opened_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = await (await self.conn.execute(query, params)).fetchall()
+        return [_row_to_incident(r) for r in rows]
+
+    # -- evidence (bounded log events that explain an incident) -----------------
+
+    async def save_evidence(
+        self, incident_id: int, alert_id: Optional[int], records: list[dict[str, Any]], *, max_per_incident: int = 200
+    ) -> int:
+        """Persist already-masked log records as evidence. Idempotent per
+        (incident, record digest) and capped per incident, so an incident that
+        lasts for hours cannot grow the database without bound."""
+        import hashlib
+
+        if not records:
+            return 0
+        current = await self.count_evidence(incident_id)
+        room = max_per_incident - current
+        if room <= 0:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        saved = 0
+        for record in records[:room]:
+            body = json.dumps({k: v for k, v in record.items() if k != "seq"}, sort_keys=True, default=str)
+            digest = hashlib.sha256(body.encode()).hexdigest()[:32]
+            await self.conn.execute(
+                """
+                INSERT INTO evidence_events
+                    (incident_id, alert_id, ts, source, service, level, summary, record_json, digest, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (incident_id, digest) DO NOTHING
+                """,
+                (
+                    incident_id, alert_id, str(record.get("ts", now)), str(record.get("type", "app")),
+                    record.get("service"), record.get("level"), str(record.get("msg") or record.get("action") or "")[:300],
+                    body, digest, now,
+                ),
+            )
+            saved += 1
+        await self.conn.commit()
+        return saved
+
+    async def count_evidence(self, incident_id: int) -> int:
+        row = await (await self.conn.execute(
+            "SELECT COUNT(*) FROM evidence_events WHERE incident_id = ?", (incident_id,))).fetchone()
+        return int(row[0]) if row else 0
+
+    async def list_evidence(self, incident_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        rows = await (await self.conn.execute(
+            "SELECT id, alert_id, ts, record_json FROM evidence_events WHERE incident_id = ? "
+            "ORDER BY ts DESC, id DESC LIMIT ?", (incident_id, limit))).fetchall()
+        return [{"id": r[0], "alert_id": r[1], "ts": r[2], "record": json.loads(r[3])} for r in rows]
+
+    # -- audit log -------------------------------------------------------------------
+
+    async def add_audit(
+        self, *, actor: str, action: str, target_type: str, target_id: Optional[str] = None,
+        detail: Optional[str] = None, outcome: str = "ok", ts: Optional[datetime] = None,
+    ) -> int:
+        new_id = await self.conn.insert(
+            "INSERT INTO audit_log (ts, actor, action, target_type, target_id, detail, outcome) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ((ts or datetime.now(timezone.utc)).isoformat(), actor, action, target_type,
+             None if target_id is None else str(target_id), (detail or "")[:500] or None, outcome),
+        )
+        await self.conn.commit()
+        return new_id
+
+    async def list_audit(
+        self, *, limit: int = 100, target_type: Optional[str] = None, target_id: Optional[str] = None,
+        action: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        for column, value in (("target_type", target_type), ("target_id", target_id), ("action", action)):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(str(value))
+        query = "SELECT id, ts, actor, action, target_type, target_id, detail, outcome FROM audit_log"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = await (await self.conn.execute(query, params)).fetchall()
+        keys = ("id", "ts", "actor", "action", "target_type", "target_id", "detail", "outcome")
+        return [dict(zip(keys, r)) for r in rows]
+
+    # -- notification settings / attempts ---------------------------------------------
+
+    async def get_notification_settings(self) -> Optional[dict[str, Any]]:
+        row = await (await self.conn.execute(
+            "SELECT enabled, recipients, min_severity, cooldown_seconds, updated_at, updated_by "
+            "FROM notification_settings WHERE id = 1")).fetchone()
+        if not row:
+            return None
+        return {"enabled": bool(row[0]), "recipients": [r for r in (row[1] or "").split(",") if r],
+                "min_severity": row[2], "cooldown_seconds": int(row[3]), "updated_at": row[4], "updated_by": row[5]}
+
+    async def save_notification_settings(
+        self, *, enabled: bool, recipients: list[str], min_severity: str, cooldown_seconds: int, updated_by: str
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO notification_settings (id, enabled, recipients, min_severity, cooldown_seconds, updated_at, updated_by)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, recipients=excluded.recipients,
+                min_severity=excluded.min_severity, cooldown_seconds=excluded.cooldown_seconds,
+                updated_at=excluded.updated_at, updated_by=excluded.updated_by
+            """,
+            (1 if enabled else 0, ",".join(recipients), min_severity, cooldown_seconds,
+             datetime.now(timezone.utc).isoformat(), updated_by),
+        )
+        await self.conn.commit()
+
+    async def add_notification_attempt(
+        self, *, channel: str, kind: str, provider: str, status: str, incident_id: Optional[int] = None,
+        severity: Optional[str] = None, provider_message_id: Optional[str] = None, detail: Optional[str] = None,
+        ts: Optional[datetime] = None,
+    ) -> int:
+        new_id = await self.conn.insert(
+            "INSERT INTO notification_attempts (ts, channel, kind, provider, status, incident_id, severity, "
+            "provider_message_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ((ts or datetime.now(timezone.utc)).isoformat(), channel, kind, provider, status, incident_id,
+             severity, provider_message_id, (detail or "")[:500] or None),
+        )
+        await self.conn.commit()
+        return new_id
+
+    async def list_notification_attempts(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = await (await self.conn.execute(
+            "SELECT id, ts, channel, kind, provider, status, incident_id, severity, provider_message_id, detail "
+            "FROM notification_attempts ORDER BY ts DESC, id DESC LIMIT ?", (limit,))).fetchall()
+        keys = ("id", "ts", "channel", "kind", "provider", "status", "incident_id", "severity",
+                "provider_message_id", "detail")
+        return [dict(zip(keys, r)) for r in rows]
 
     async def max_incident_id(self) -> int:
         cursor = await self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM incidents")
@@ -368,6 +454,14 @@ class Store:
             incident_ids,
         )
         return {row[0]: datetime.fromisoformat(row[1]) for row in await cursor.fetchall()}
+
+    async def recent_incident_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = await (await self.conn.execute(
+            "SELECT e.id, e.incident_id, e.ts, e.event_type, e.severity, e.detail, i.kind, i.service, i.user_id "
+            "FROM incident_events e LEFT JOIN incidents i ON i.id = e.incident_id "
+            "ORDER BY e.ts DESC, e.id DESC LIMIT ?", (limit,))).fetchall()
+        keys = ("id", "incident_id", "ts", "event_type", "severity", "detail", "kind", "service", "user_id")
+        return [dict(zip(keys, r)) for r in rows]
 
     # -- analytics ---------------------------------------------------------------
 
@@ -404,13 +498,12 @@ class Store:
         return [(r[0], r[1], r[2] or 0, r[3] or 0, r[4] or 0.0) for r in await cursor.fetchall()]
 
     async def save_incident_event(self, event: IncidentEvent) -> int:
-        cursor = await self.conn.execute(
+        new_id = await self.conn.insert(
             "INSERT INTO incident_events (incident_id, ts, event_type, severity, detail) VALUES (?, ?, ?, ?, ?)",
             (event.incident_id, event.ts.isoformat(), event.event_type, event.severity, event.detail),
         )
         await self.conn.commit()
-        assert cursor.lastrowid is not None
-        return cursor.lastrowid
+        return new_id
 
     async def list_incident_events(self, incident_id: int) -> list[IncidentEvent]:
         cursor = await self.conn.execute(
@@ -460,10 +553,25 @@ def _row_to_alert(row) -> Alert:
     )
 
 
+_INCIDENT_COLS = (
+    "id, fingerprint, kind, service, user_id, state, peak_severity, alert_count, opened_at, acknowledged_at, "
+    "resolved_at, mttr_seconds, pinned, pinned_at, investigating_at, last_seen_at, peak_score, muted_until"
+)
+
+
+def _dt(value: Optional[str]) -> Optional[datetime]:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _row_to_incident(row) -> Incident:
     return Incident(
         id=row[0], fingerprint=row[1], kind=row[2], service=row[3], user_id=row[4], state=row[5],
         peak_severity=row[6], alert_count=row[7], opened_at=datetime.fromisoformat(row[8]),
-        acknowledged_at=datetime.fromisoformat(row[9]) if row[9] else None,
-        resolved_at=datetime.fromisoformat(row[10]) if row[10] else None, mttr_seconds=row[11],
+        acknowledged_at=_dt(row[9]), resolved_at=_dt(row[10]), mttr_seconds=row[11],
+        pinned=bool(row[12]), pinned_at=_dt(row[13]), investigating_at=_dt(row[14]), last_seen_at=_dt(row[15]),
+        peak_score=row[16], muted_until=_dt(row[17]),
     )

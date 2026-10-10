@@ -36,9 +36,11 @@ from app.detect.baseline import BaselineEngine
 from app.detect.severity import score_hipaa_anomaly, score_service_anomaly
 from app.detect.window import SlidingWindow
 from app.incidents.engine import IncidentEngine, IncidentUpdate, fingerprint_for
+from app.incidents.view import incident_view
 from app.ingest.tailer import Tailer
 from app.models import Alert, Anomaly, AppEvent, AuditEvent, WindowMetrics
 from app.notify.aws import AwsNotifier
+from app.notify.mailer import EmailNotifier, EmailSettings
 from app.parse.enricher import Enricher
 from app.parse.parser import Parser
 from app.store.db import Store
@@ -104,6 +106,7 @@ class ServiceState:
 
 class Pipeline:
     def __init__(self, settings: Settings, config: AppConfig) -> None:
+        self._last_metric_save: dict[str, float] = {}
         self.settings = settings
         self.config = config
 
@@ -115,15 +118,19 @@ class Pipeline:
         self.anomaly_engine = AnomalyEngine(config.anomaly, self.baseline)
         self.access_detector = AccessDetector(config.hipaa)
         self.incidents = IncidentEngine(config.incident)
-        self.store = Store(settings.db_path)
+        self.store = Store(settings.db_path, settings.database_url or None)
         self.notifier = AwsNotifier(
             mode=settings.aws_mode,
             region=settings.aws_region,
             log_group=settings.cloudwatch_log_group,
+            log_stream=settings.cloudwatch_log_stream,
             sns_topic_arn=settings.sns_topic_arn,
             mock_log_path=settings.log_dir.parent / "aws_mock.log",
         )
+        self.email = EmailNotifier(EmailSettings.from_settings(settings), app_config=config)
         self.broadcaster = Broadcaster()
+        self.db_errors = 0
+        self.last_db_error: Optional[str] = None
 
         self.service_states: dict[str, ServiceState] = {}
         self.recent_alerts: list[Alert] = []  # newest last; capped at _MAX_RECENT_ALERTS
@@ -159,6 +166,9 @@ class Pipeline:
         await self.baseline.load(self.store)
         await self._restore_incidents()
         await self.notifier.start()
+        await self._load_notification_prefs()
+        self.email.attempt_hook = self._record_email_attempt
+        await self.email.start()
 
         positions = await self.store.load_tail_positions()
         # First run (nothing learned, nothing read): replay existing history,
@@ -214,7 +224,51 @@ class Pipeline:
             self._consumer_task = None
         await self._save_state(save_positions=drained)
         await self.notifier.stop()
+        await self.email.stop()
         await self.store.close()
+
+    async def _load_notification_prefs(self) -> None:
+        """Settings saved from the UI win over the env defaults; on first run
+        the env defaults are written once so the UI shows what is in effect.
+        A database problem here must never stop monitoring."""
+        try:
+            saved = await self.store.get_notification_settings()
+            if saved is None:
+                es = self.email.settings
+                await self.store.save_notification_settings(
+                    enabled=es.enabled, recipients=es.recipients, min_severity=es.min_severity,
+                    cooldown_seconds=es.cooldown_seconds, updated_by="system")
+            else:
+                self.email.apply_prefs(
+                    enabled=saved["enabled"], recipients=saved["recipients"] or self.email.settings.recipients,
+                    min_severity=saved["min_severity"], cooldown_seconds=saved["cooldown_seconds"])
+        except Exception as exc:
+            self._db_failed("load notification settings", exc)
+
+    async def _record_email_attempt(self, info: dict[str, Any]) -> None:
+        try:
+            await self.store.add_notification_attempt(
+                channel="email", kind=info.get("kind", "incident"), provider=info.get("provider", "unknown"),
+                status=info["status"], incident_id=info.get("incident_id"), severity=info.get("severity"),
+                provider_message_id=info.get("provider_message_id"), detail=info.get("detail"))
+        except Exception as exc:
+            self._db_failed("record notification attempt", exc)
+
+    def _db_failed(self, what: str, exc: BaseException) -> None:
+        """Count and log a persistence failure without raising: the detector,
+        WebSocket and notifiers must keep running when the database hiccups."""
+        self.db_errors += 1
+        self.last_db_error = f"{what}: {type(exc).__name__}"
+        logger.error("pipeline: database error during %s (%s): %s", what, type(exc).__name__, str(exc)[:200])
+
+    async def audit(self, actor: str, action: str, target_type: str, target_id: object = None,
+                    detail: Optional[str] = None, outcome: str = "ok") -> None:
+        try:
+            await self.store.add_audit(actor=actor, action=action, target_type=target_type,
+                                       target_id=None if target_id is None else str(target_id),
+                                       detail=detail, outcome=outcome)
+        except Exception as exc:
+            self._db_failed("write audit log", exc)
 
     async def _restore_incidents(self) -> None:
         stored = await self.store.list_incidents(limit=500)
@@ -347,6 +401,17 @@ class Pipeline:
         for update in self.incidents.sweep_hipaa_timeouts(clock):
             await self.apply_incident_update(update)
 
+    def _should_persist_metrics(self, metrics: WindowMetrics) -> bool:
+        interval = self.settings.metrics_persist_interval_seconds
+        if interval <= 0:
+            return True
+        last = self._last_metric_save.get(metrics.service)
+        now = time.monotonic()
+        if last is not None and now - last < interval:
+            return False
+        self._last_metric_save[metrics.service] = now
+        return True
+
     async def _process_window_metrics(self, metrics: WindowMetrics) -> None:
         metrics.malformed_lines = self.parser.malformed_lines
         # The baseline this window is judged against, captured before
@@ -358,7 +423,8 @@ class Pipeline:
         result = self.anomaly_engine.evaluate(metrics)
         self._update_service_state(metrics)
 
-        await self.store.save_metrics(metrics)
+        if self._should_persist_metrics(metrics):
+            await self.store.save_metrics(metrics)
         await self._broadcast_live({"type": "metric", **self.service_states[metrics.service].to_dict(),
                                     **metrics.model_dump(mode="json")})
 
@@ -448,7 +514,10 @@ class Pipeline:
         update = self.incidents.record_alert(anomaly, alert)
         alert.incident_id = update.incident.id
 
-        alert.id = await self.store.save_alert(alert)
+        try:
+            alert.id = await self.store.save_alert(alert)
+        except Exception as exc:
+            self._db_failed("save alert", exc)
         self._remember_alert(alert)
         self.alerts_emitted += 1
         fresh = datetime.now(timezone.utc) - alert.ts <= NOTIFY_MAX_AGE
@@ -457,15 +526,67 @@ class Pipeline:
         await self._broadcast_live({"type": "alert", **alert.model_dump(mode="json")})
 
         await self.apply_incident_update(update)
+        await self._capture_evidence(update.incident, alert)
         if fresh and update.should_notify and (update.is_new or update.is_escalation):
             self.notifier.notify_incident(update.incident, alert.explanation)
+            self.email.notify_incident(update.incident, alert, escalated=update.is_escalation)
+
+    EVIDENCE_PER_ALERT = 15
+
+    def evidence_candidates(self, alert: Alert) -> list[dict[str, Any]]:
+        """Recent already-masked log records that explain ``alert``: the failing
+        or slowest requests of the service, or the user's recent audit actions."""
+        try:
+            alert_ts = alert.ts
+            out: list[dict[str, Any]] = []
+            for record in reversed(self.recent_logs):
+                try:
+                    delta = (alert_ts - datetime.fromisoformat(record["ts"])).total_seconds()
+                except (KeyError, ValueError):
+                    continue
+                if delta < 0 and not self.replay_active:
+                    continue
+                if alert.kind.startswith("hipaa_"):
+                    if record.get("type") != "audit" or record.get("user_id") != alert.user_id or delta > 600:
+                        continue
+                else:
+                    if record.get("type") != "app" or record.get("service") != alert.service or delta > 120:
+                        continue
+                    if alert.kind == "error_rate" and not record.get("is_error"):
+                        continue
+                out.append(record)
+                if len(out) >= self.EVIDENCE_PER_ALERT * (4 if alert.kind == "latency_degradation" else 1):
+                    break
+            if alert.kind == "latency_degradation":
+                out.sort(key=lambda r: r.get("latency_ms", 0), reverse=True)
+            return out[: self.EVIDENCE_PER_ALERT]
+        except Exception:  # evidence is best-effort
+            logger.exception("pipeline: evidence selection failed")
+            return []
+
+    async def _capture_evidence(self, incident, alert: Alert) -> None:
+        if incident.id is None:
+            return
+        records = self.evidence_candidates(alert)
+        if not records:
+            return
+        try:
+            await self.store.save_evidence(incident.id, alert.id, records)
+        except Exception as exc:
+            self._db_failed("save evidence", exc)
 
     async def apply_incident_update(self, update: IncidentUpdate) -> None:
-        await self.store.upsert_incident(update.incident)
+        try:
+            await self.store.upsert_incident(update.incident)
+        except Exception as exc:
+            self._db_failed("save incident", exc)
         for event in update.events:
-            event.id = await self.store.save_incident_event(event)
+            try:
+                event.id = await self.store.save_incident_event(event)
+            except Exception as exc:
+                self._db_failed("save incident event", exc)
             await self._broadcast_live(
-                {"type": "incident_update", "incident": update.incident.model_dump(mode="json"),
+                {"type": "incident_update", "incident": incident_view(update.incident),
                  **event.model_dump(mode="json")}
             )
 
@@ -525,6 +646,9 @@ class Pipeline:
             "malformed_lines": self.parser.malformed_lines,
             "aws_mode": self.settings.aws_mode,
             "notifier_queue_depth": self.notifier.queue_depth,
+            "email_enabled": self.email.settings.enabled,
+            "email_queue_depth": self.email.queue_depth,
+            "database": {"dialect": self.store.dialect, "errors": self.db_errors, "last_error": self.last_db_error},
             "demo_mode": self.settings.demo_mode,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "uptime_seconds": (now - self.started_at).total_seconds() if self.started_at else 0,
@@ -565,7 +689,7 @@ class Pipeline:
             "type": "snapshot",
             "services": self.services_snapshot(),
             "alerts": [a.model_dump(mode="json") for a in self.recent_alerts[-50:]],
-            "incidents": [i.model_dump(mode="json") for i in self.incidents.list_incidents()],
+            "incidents": [incident_view(i) for i in self.incidents.list_incidents()],
             "metrics": {s.service: s.to_dict() for s in self.service_states.values()},
             "health": self.health_snapshot(),
             "logs": list(self.recent_logs)[-100:],

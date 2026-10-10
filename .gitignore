@@ -12,3 +12,18 @@ frontend/dist/
 .claude/
 .agents/
 skills-lock.json
+# secrets: never committed (only the template .env.example is)
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+credentials
+credentials.csv
+*_accessKeys.csv
+*.p12
+*.pfx
+secrets/
+*secret*.json
+client_secret*.json
+token.json

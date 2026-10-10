@@ -32,9 +32,11 @@ RUN useradd --system --uid 10001 --home /app healthtrace \
     && chown -R healthtrace /app/data
 USER healthtrace
 
+# Hosts such as Render inject PORT; local/compose runs default to 8000.
+ENV PORT=8000
 EXPOSE 8000
-HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2).status == 200 else 1)"
+HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
+  CMD python -c "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8000'), timeout=2).status == 200 else 1)"
 
 # --proxy-headers: behind the ALB, trust X-Forwarded-* for the scheme (wss/https).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]

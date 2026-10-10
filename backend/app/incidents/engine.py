@@ -31,6 +31,17 @@ from app.config import IncidentConfig
 from app.models import Alert, Anomaly, Incident, IncidentEvent, Severity
 
 _SEVERITY_ORDER: dict[Severity, int] = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+# Lifecycle states in which an incident still absorbs new alerts for its fingerprint.
+ACTIVE_STATES = ("OPEN", "ACKNOWLEDGED", "INVESTIGATING")
+
+
+def _track_peak_score(incident: Incident, alert: Alert) -> None:
+    """Keep the highest *real* detector score. HIPAA rules have no continuous
+    score (the alert carries 0.0 as a placeholder), so they leave this None."""
+    if alert.kind.startswith("hipaa_"):
+        return
+    if incident.peak_score is None or alert.score > incident.peak_score:
+        incident.peak_score = alert.score
 
 
 def fingerprint_for(anomaly: Anomaly) -> str:
@@ -84,7 +95,7 @@ class IncidentEngine:
         fp = fingerprint_for(anomaly)
         state = self._by_fingerprint.get(fp)
 
-        if state is not None and state.incident.state in ("OPEN", "ACKNOWLEDGED"):
+        if state is not None and state.incident.state in ACTIVE_STATES:
             return self._attach(state, anomaly, alert)
 
         # No active incident for this fingerprint right now: a fresh one,
@@ -102,6 +113,8 @@ class IncidentEngine:
         state.last_alert_ts = anomaly.ts
         incident = state.incident
         incident.alert_count += 1
+        incident.last_seen_at = anomaly.ts
+        _track_peak_score(incident, alert)
 
         escalated = _SEVERITY_ORDER[alert.severity] > _SEVERITY_ORDER[incident.peak_severity]
         if escalated:
@@ -131,7 +144,9 @@ class IncidentEngine:
             peak_severity=alert.severity,
             alert_count=1,
             opened_at=anomaly.ts,
+            last_seen_at=anomaly.ts,
         )
+        _track_peak_score(incident, alert)
         self._next_id += 1
 
         new_state = _IncidentState(
@@ -152,6 +167,32 @@ class IncidentEngine:
         state.incident.state = "ACKNOWLEDGED"
         state.incident.acknowledged_at = now
         event = IncidentEvent(incident_id=incident_id, ts=now, event_type="acknowledged")
+        return IncidentUpdate(incident=state.incident, events=[event])
+
+    def investigate(self, incident_id: int, now: datetime) -> Optional[IncidentUpdate]:
+        """Mark an active incident as being worked on. Detection keeps
+        attaching alerts and auto-resolve still applies."""
+        state = self._by_id.get(incident_id)
+        if state is None or state.incident.state not in ("OPEN", "ACKNOWLEDGED"):
+            return None
+        state.incident.state = "INVESTIGATING"
+        state.incident.investigating_at = now
+        if state.incident.acknowledged_at is None:
+            state.incident.acknowledged_at = now
+        event = IncidentEvent(incident_id=incident_id, ts=now, event_type="investigating")
+        return IncidentUpdate(incident=state.incident, events=[event])
+
+    def set_pinned(self, incident_id: int, pinned: bool, now: datetime) -> Optional[IncidentUpdate]:
+        """Pin/unpin a tracked incident. Only the ``pinned`` flag changes:
+        severity, risk score and status are deliberately untouched."""
+        state = self._by_id.get(incident_id)
+        if state is None:
+            return None
+        if state.incident.pinned == pinned:
+            return IncidentUpdate(incident=state.incident)
+        state.incident.pinned = pinned
+        state.incident.pinned_at = now if pinned else None
+        event = IncidentEvent(incident_id=incident_id, ts=now, event_type="pinned" if pinned else "unpinned")
         return IncidentUpdate(incident=state.incident, events=[event])
 
     def mute(self, incident_id: int, now: datetime, minutes: float) -> Optional[IncidentUpdate]:
@@ -189,7 +230,7 @@ class IncidentEngine:
 
     def record_normal_window(self, kind: str, service: str, window_end: datetime) -> Optional[IncidentUpdate]:
         state = self._by_fingerprint.get(f"{kind}:{service}")
-        if state is None or state.incident.state not in ("OPEN", "ACKNOWLEDGED"):
+        if state is None or state.incident.state not in ACTIVE_STATES:
             return None
         state.consecutive_normal_windows += 1
         if state.consecutive_normal_windows >= self._config.service_auto_resolve_windows:
@@ -202,7 +243,7 @@ class IncidentEngine:
         timeout = timedelta(minutes=self._config.hipaa_auto_resolve_minutes)
         updates = []
         for state in self._by_fingerprint.values():
-            if state.incident.state not in ("OPEN", "ACKNOWLEDGED"):
+            if state.incident.state not in ACTIVE_STATES:
                 continue
             if not state.incident.kind.startswith("hipaa_"):
                 continue

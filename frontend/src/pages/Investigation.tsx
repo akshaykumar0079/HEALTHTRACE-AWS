@@ -11,6 +11,7 @@ import {
   Cloud,
   Eye,
   Lightning,
+  PushPin,
   Siren,
   XCircle,
 } from "@phosphor-icons/react";
@@ -39,6 +40,7 @@ import { MIN_STD, Z_THRESHOLD } from "@/lib/series";
 import { Bezel, EmptyState, ErrorState, Panel, PanelHeader, SeverityBadge, Skeleton, StateBadge, cx } from "@/components/ui";
 import { TimeSeries, type TsPoint } from "@/components/charts";
 import { IncidentActions, LogLine } from "@/components/domain";
+import { RiskScore } from "@/components/IncidentTable";
 import TelemetryCanvas from "@/three/TelemetryCanvas";
 
 const EVENT_META: Record<IncidentEvent["event_type"], { label: string; icon: typeof Circle }> = {
@@ -46,6 +48,9 @@ const EVENT_META: Record<IncidentEvent["event_type"], { label: string; icon: typ
   alert_attached: { label: "Alert attached", icon: Circle },
   escalated: { label: "Severity escalated", icon: Lightning },
   acknowledged: { label: "Acknowledged", icon: Eye },
+  investigating: { label: "Investigation started", icon: Eye },
+  pinned: { label: "Pinned", icon: Circle },
+  unpinned: { label: "Unpinned", icon: Circle },
   resolved: { label: "Resolved by operator", icon: CheckCircle },
   auto_resolved: { label: "Resolved automatically", icon: CheckCircle },
   muted: { label: "Notifications changed", icon: BellSimpleRinging },
@@ -390,8 +395,8 @@ export default function Investigation() {
 
   return (
     <div className="space-y-5">
-      <Link to="/app/anomalies" className="inline-flex items-center gap-1.5 text-[12.5px] text-fg-dim hover:text-fg">
-        <ArrowLeft size={14} /> Anomalies
+      <Link to="/app/incidents" className="inline-flex items-center gap-1.5 text-[12.5px] text-fg-dim hover:text-fg">
+        <ArrowLeft size={14} /> Incidents
       </Link>
 
       <motion.div {...fade(0)}>
@@ -402,6 +407,8 @@ export default function Investigation() {
                 <SeverityBadge severity={inc.peak_severity} />
                 <StateBadge state={inc.state} />
                 <span className="font-mono text-[12px] text-fg-dim">#{inc.id}</span>
+                <span className="inline-flex items-center gap-1.5 text-[12px] text-fg-muted">Risk score <RiskScore incident={inc} /></span>
+                {inc.pinned && <span className="inline-flex items-center gap-1 rounded-full bg-[#56dcc812] px-2.5 py-1 text-[11px] font-medium text-signal"><PushPin size={11} weight="fill" /> Pinned</span>}
               </div>
               <h1 className="mt-4 text-[28px] font-semibold leading-[1.1] tracking-[-0.025em] text-fg md:text-[36px]">
                 {subjectOf(inc)}: {KIND_LABEL[inc.kind].toLowerCase()}
@@ -461,6 +468,43 @@ export default function Investigation() {
           <Delivery detail={detail} />
         </motion.div>
       </div>
+
+      <Panel>
+        <PanelHeader
+          title="Evidence"
+          description="Masked log events captured when this incident was detected. They are stored with the incident and stay after the live buffer has moved on."
+        />
+        {detail.evidence.length === 0 ? (
+          <EmptyState title="No evidence stored" body="Evidence is captured for incidents detected while this version is running." className="py-10" />
+        ) : (
+          <div className="overflow-x-auto border-t border-[var(--hairline)]">
+            <table className="w-full min-w-[640px] text-left text-[12.5px]">
+              <thead className="text-[11px] text-fg-dim">
+                <tr className="border-b border-[var(--hairline)]">
+                  <th className="px-5 py-2.5 font-normal">Time</th>
+                  <th className="px-3 py-2.5 font-normal">Level</th>
+                  <th className="px-3 py-2.5 font-normal">Source</th>
+                  <th className="px-5 py-2.5 font-normal">Event</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--hairline)]">
+                {detail.evidence.map((e) => (
+                  <tr key={e.id} className="hover:bg-ink-800/60">
+                    <td className="whitespace-nowrap px-5 py-2.5 font-mono text-fg-dim">{stamp(e.ts)}</td>
+                    <td className="px-3 py-2.5 font-mono text-fg-muted">{String(e.record.level ?? "")}</td>
+                    <td className="px-3 py-2.5 text-fg-muted">{String(e.record.service ?? e.record.user_id ?? "")}</td>
+                    <td className="px-5 py-2.5 text-fg-muted">
+                      {String(e.record.msg ?? "")}
+                      {e.record.status != null && <span className="ml-2 font-mono text-fg-dim">{String(e.record.status)} · {String(e.record.latency_ms ?? "-")}ms</span>}
+                      {e.record.patient_id != null && <span className="ml-2 font-mono text-fg-dim">{String(e.record.patient_id)}</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
 
       <Panel>
         <PanelHeader title="Alert history" description={`${detail.alerts.length} alert${detail.alerts.length === 1 ? "" : "s"} fingerprinted to this anomaly, newest first.`} />

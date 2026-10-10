@@ -64,7 +64,7 @@ export function Toaster() {
                 <button
                   className="block w-full text-left"
                   onClick={() => {
-                    if (t.alert?.incident_id) navigate(`/app/anomalies/${t.alert.incident_id}`);
+                    if (t.alert?.incident_id) navigate(`/app/incidents/${t.alert.incident_id}`);
                     dismiss(t.id);
                   }}
                 >

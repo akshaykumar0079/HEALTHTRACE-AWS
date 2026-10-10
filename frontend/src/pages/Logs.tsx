@@ -54,7 +54,7 @@ function Detail({ record, onClose }: { record: LogRecord; onClose: () => void })
             <ul className="mt-2 space-y-2">
               {data.related_alerts.map((a) => (
                 <li key={`${a.id}-${a.ts}`}>
-                  <Link to={a.incident_id ? `/app/anomalies/${a.incident_id}` : "/app/alerts"} className="flex items-center gap-2 rounded-[10px] bg-ink-800 px-3 py-2 text-[12.5px] text-fg-muted hover:text-fg">
+                  <Link to={a.incident_id ? `/app/incidents/${a.incident_id}` : "/app/alerts"} className="flex items-center gap-2 rounded-[10px] bg-ink-800 px-3 py-2 text-[12.5px] text-fg-muted hover:text-fg">
                     <SeverityBadge severity={a.severity} size="sm" />
                     <span className="flex-1 truncate">{KIND_LABEL[a.kind]}</span>
                     <ArrowRight size={12} />

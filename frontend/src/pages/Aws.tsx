@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { BellRinging, CheckCircle, Cloud, Key, PaperPlaneTilt, Plugs, WarningOctagon } from "@phosphor-icons/react";
+import { BellRinging, CheckCircle, Cloud, EnvelopeSimple, Key, PaperPlaneTilt, Plugs, WarningOctagon } from "@phosphor-icons/react";
 import { api } from "@/lib/api";
-import type { AwsCheckResult, ChannelStatus } from "@/lib/types";
+import type { AwsCheckResult, ChannelStatus, EmailStatus } from "@/lib/types";
 import { SIGNAL_HEX, SEVERITY_HEX, ago, num } from "@/lib/format";
 import { Beacon, Button, ErrorState, PageHeader, Panel, PanelHeader, Skeleton, cx } from "@/components/ui";
 import { toast } from "@/app/toast";
@@ -17,8 +17,13 @@ const IAM_POLICY = `{
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups"],
-      "Resource": "arn:aws:logs:<region>:<account>:log-group:/medguard/alerts*"
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:<region>:<account>:log-group:<CLOUDWATCH_LOG_GROUP>:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
     },
     {
       "Effect": "Allow",
@@ -64,8 +69,41 @@ function Channel({ icon, title, target, s, configured }: { icon: React.ReactNode
   );
 }
 
+function EmailChannel({ e }: { e: EmailStatus }) {
+  const rows: [string, React.ReactNode][] = [
+    ["Email notification", e.enabled ? "Enabled" : "Disabled"],
+    ["Email recipient", e.recipients.join(", ") || "(none)"],
+    ["Email status", e.configured ? "Configured" : e.enabled ? `Not configured: ${e.missing.join(", ")} missing` : "Not configured"],
+    ["Delivered by", e.provider === "brevo" ? "Brevo email API (HTTPS)" : `SMTP ${e.host}:${e.port}${e.use_tls ? " (STARTTLS)" : e.port === 465 ? " (SSL)" : ""}`],
+    ["Sender", e.sender ?? (e.provider === "brevo" ? "(ALERT_EMAIL_FROM)" : "(SMTP_USERNAME)")],
+    ["Sends for", `${e.severities.join(" and ")} incidents, once when opened and once per escalation`],
+  ];
+  return (
+    <div className="grid gap-5 lg:grid-cols-2">
+      <Channel icon={<EnvelopeSimple size={16} />} title={e.provider === "brevo" ? "Email (Brevo)" : "Email (SMTP)"} target={e.recipients.join(", ") || "ALERT_EMAIL_TO not set"} s={e} configured={e.enabled && e.configured} />
+      <Panel>
+        <PanelHeader title="Email settings" description="Set in the backend's local .env (run scripts/setup_email.py). API keys and passwords are never sent to the browser. AWS is not needed for email." />
+        <dl className="divide-y divide-[var(--hairline)] border-t border-[var(--hairline)] text-[12.5px]">
+          {rows.map(([k, v]) => (
+            <div key={k} className="grid gap-1 px-5 py-3 sm:grid-cols-[170px_1fr]">
+              <dt className="text-fg-dim">{k}</dt>
+              <dd className="break-all font-mono text-fg">{v}</dd>
+            </div>
+          ))}
+        </dl>
+        {e.config_warnings.length > 0 && (
+          <div className="space-y-1.5 border-t border-[var(--hairline)] px-5 py-4">
+            {e.config_warnings.map((w) => <CheckLine key={w} name="Config" result={{ ok: false, detail: w }} />)}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 export default function Aws() {
   const status = useQuery({ queryKey: ["aws-status"], queryFn: api.awsStatus, refetchInterval: 5000 });
+  const email = useQuery({ queryKey: ["email-status"], queryFn: api.emailStatus, refetchInterval: 5000 });
   const onDone = (label: string) => (r: AwsCheckResult) => {
     const ok = r.cloudwatch.ok && r.sns.ok;
     (ok ? toast.success : toast.error)(`${label}: ${ok ? "all channels OK" : "check the results"}`, `CloudWatch: ${r.cloudwatch.detail}. SNS: ${r.sns.detail}.`);
@@ -84,8 +122,8 @@ export default function Aws() {
   return (
     <div className="space-y-5">
       <PageHeader
-        title="AWS"
-        description="Alerts are shipped to CloudWatch Logs and paged through SNS. The backend never holds AWS keys: in AWS it uses its ECS task role."
+        title="Notifications"
+        description="HIGH and CRITICAL incidents are emailed directly over SMTP (no AWS needed). Optionally, alerts are also shipped to CloudWatch Logs and paged through SNS; the backend never holds AWS keys."
         actions={
           <>
             <Button icon={<Plugs size={15} />} busy={test.isPending} onClick={() => test.mutate()}>Test connection</Button>
@@ -95,6 +133,8 @@ export default function Aws() {
           </>
         }
       />
+
+      {email.data && <EmailChannel e={email.data} />}
 
       <Panel>
         <div className="grid divide-[var(--hairline)] md:grid-cols-4 md:divide-x">
@@ -120,6 +160,13 @@ export default function Aws() {
             <p className="mt-2 text-[12px] text-fg-dim">Retries 5 times with exponential backoff and never blocks detection.</p>
           </div>
         </div>
+        {(d.config_warnings?.length ?? 0) > 0 && (
+          <div className="space-y-1.5 border-t border-[var(--hairline)] px-5 py-4">
+            {d.config_warnings!.map((w) => (
+              <CheckLine key={w} name="Config" result={{ ok: false, detail: w }} />
+            ))}
+          </div>
+        )}
         {lastCheck && (
           <div className="space-y-1.5 border-t border-[var(--hairline)] px-5 py-4">
             <CheckLine name="CloudWatch" result={lastCheck.cloudwatch} />
@@ -140,7 +187,8 @@ export default function Aws() {
             {[
               ["AWS_MODE", d.mode, "off, mock or live"],
               ["AWS_REGION", d.region, "region for both clients"],
-              ["CLOUDWATCH_LOG_GROUP", d.cloudwatch.log_group, "created on first alert"],
+              ["CLOUDWATCH_LOG_GROUP", d.cloudwatch.log_group, "pre-create it, or grant logs:CreateLogGroup"],
+              ["CLOUDWATCH_LOG_STREAM", d.cloudwatch.log_stream ?? "daily (YYYY-MM-DD)", "created on first alert"],
               ["SNS_TOPIC_ARN", d.sns.topic_arn ?? "(unset)", "HIGH and CRITICAL pages"],
             ].map(([k, v, hint]) => (
               <div key={k} className="grid gap-1 px-5 py-3 sm:grid-cols-[200px_1fr]">
@@ -151,7 +199,7 @@ export default function Aws() {
           </dl>
         </Panel>
         <Panel>
-          <PanelHeader title="Least-privilege IAM policy" description="Attach to the ECS task role. Nothing else is required." />
+          <PanelHeader title="Least-privilege IAM policy" description="Attach to the ECS task role or your own IAM identity. Add logs:CreateLogGroup only if the app should create the group itself (docs/aws-iam.md)." />
           <pre className="mx-5 mb-5 overflow-x-auto rounded-[12px] bg-ink-950 p-4 font-mono text-[11.5px] leading-relaxed text-fg-muted shadow-[inset_0_0_0_1px_var(--hairline)]">
             {IAM_POLICY}
           </pre>

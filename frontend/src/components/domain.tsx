@@ -1,7 +1,8 @@
 import { Link } from "react-router";
 import { motion, useReducedMotion } from "motion/react";
-import { useMutation } from "@tanstack/react-query";
-import { ArrowRight, BellSlash, CheckCircle, Eye } from "@phosphor-icons/react";
+import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ArrowRight, BellSlash, CheckCircle, Eye, MagnifyingGlass, PushPin } from "@phosphor-icons/react";
 import type { Alert, Incident, LogRecord, ServiceRow } from "@/lib/types";
 import {
   KIND_LABEL,
@@ -18,7 +19,8 @@ import {
   serviceTone,
   subjectOf,
 } from "@/lib/format";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
+import { ConfirmDialog } from "./Confirm";
 import { useLive } from "@/lib/live";
 import { toast } from "@/app/toast";
 import { Button, SeverityBadge, StateBadge, cx } from "./ui";
@@ -27,49 +29,105 @@ import { Sparkline } from "./charts";
 // -- incident actions ---------------------------------------------------------------
 
 export function useIncidentActions() {
+  const qc = useQueryClient();
   const upsert = useLive((s) => s.upsertIncident);
-  const onError = (verb: string) => (e: unknown) =>
-    toast.error(`Could not ${verb}`, e instanceof Error ? e.message : undefined);
+  const refresh = (inc: Incident) => {
+    upsert(inc);
+    void qc.invalidateQueries({ queryKey: ["incidents"] });
+    void qc.invalidateQueries({ queryKey: ["incident-summary"] });
+    void qc.invalidateQueries({ queryKey: ["incident", inc.id] });
+  };
+  const onError = (verb: string) => (e: unknown) => {
+    const forbidden = e instanceof ApiError && (e.status === 401 || e.status === 403);
+    toast.error(
+      `Could not ${verb}`,
+      forbidden ? "Operator access is required. Add the operator token under Settings, API access." : e instanceof Error ? e.message : undefined,
+    );
+  };
   const ack = useMutation({
     mutationFn: api.ack,
     onSuccess: (inc) => {
-      upsert(inc);
-      toast.success("Acknowledged", `Anomaly #${inc.id} is now owned. Detection keeps attaching new alerts.`);
+      refresh(inc);
+      toast.success("Acknowledged", `Incident #${inc.id} is now owned. Detection keeps attaching new alerts.`);
     },
     onError: onError("acknowledge"),
+  });
+  const investigate = useMutation({
+    mutationFn: api.investigate,
+    onSuccess: (inc) => {
+      refresh(inc);
+      toast.success("Investigating", `Incident #${inc.id} is marked as being worked on.`);
+    },
+    onError: onError("start investigating"),
   });
   const resolve = useMutation({
     mutationFn: api.resolve,
     onSuccess: (inc) => {
-      upsert(inc);
-      toast.success("Resolved", `Anomaly #${inc.id} closed after ${duration(inc.mttr_seconds)}.`);
+      refresh(inc);
+      toast.success("Resolved", `Incident #${inc.id} moved to History after ${duration(inc.mttr_seconds)}.`);
     },
     onError: onError("resolve"),
   });
   const mute = useMutation({
     mutationFn: ({ id, minutes }: { id: number; minutes: number }) => api.mute(id, minutes),
     onSuccess: (inc) => {
-      upsert(inc);
+      refresh(inc);
       toast.success(inc.muted_until ? "Notifications muted" : "Notifications unmuted",
-        inc.muted_until ? "AWS notifications are paused for this anomaly. Detection continues." : undefined);
+        inc.muted_until ? "Notifications are paused for this incident. Detection continues." : undefined);
     },
     onError: onError("mute"),
   });
-  return { ack, resolve, mute };
+  const pin = useMutation({
+    mutationFn: ({ id, pinned }: { id: number; pinned: boolean }) => (pinned ? api.pin(id) : api.unpin(id)),
+    onSuccess: (inc) => {
+      refresh(inc);
+      toast.success(inc.pinned ? "Pinned" : "Unpinned", inc.pinned ? `Incident #${inc.id} is on your Pinned list. Severity is unchanged.` : undefined);
+    },
+    onError: onError("change the pin"),
+  });
+  return { ack, investigate, resolve, mute, pin };
+}
+
+export function PinButton({ incident, className }: { incident: Incident; className?: string }) {
+  const { pin } = useIncidentActions();
+  return (
+    <button
+      type="button"
+      aria-pressed={incident.pinned}
+      aria-label={incident.pinned ? `Unpin incident ${incident.id}` : `Pin incident ${incident.id}`}
+      title={incident.pinned ? "Pinned. Click to unpin" : "Pin to keep this incident on your Pinned list"}
+      disabled={pin.isPending}
+      onClick={() => pin.mutate({ id: incident.id, pinned: !incident.pinned })}
+      className={cx(
+        "grid size-8 place-items-center rounded-[var(--radius-control)] transition-colors hover:bg-ink-750 disabled:opacity-50",
+        incident.pinned ? "text-signal" : "text-fg-dim hover:text-fg-muted",
+        className,
+      )}
+    >
+      <PushPin size={16} weight={incident.pinned ? "fill" : "regular"} />
+    </button>
+  );
 }
 
 export function IncidentActions({ incident, compact }: { incident: Incident; compact?: boolean }) {
-  const { ack, resolve, mute } = useIncidentActions();
-  if (incident.state === "RESOLVED") return null;
+  const { ack, investigate, resolve, mute } = useIncidentActions();
+  const [confirming, setConfirming] = useState(false);
+  if (incident.state === "RESOLVED") return <PinButton incident={incident} />;
   const muted = incident.muted_until && new Date(incident.muted_until).getTime() > Date.now();
   return (
     <div className="flex flex-wrap items-center gap-1.5">
+      <PinButton incident={incident} />
       {incident.state === "OPEN" && (
         <Button size="sm" variant="secondary" busy={ack.isPending} onClick={() => ack.mutate(incident.id)} icon={<Eye size={14} />}>
           Acknowledge
         </Button>
       )}
-      <Button size="sm" variant="secondary" busy={resolve.isPending} onClick={() => resolve.mutate(incident.id)} icon={<CheckCircle size={14} />}>
+      {(incident.state === "OPEN" || incident.state === "ACKNOWLEDGED") && (
+        <Button size="sm" variant="secondary" busy={investigate.isPending} onClick={() => investigate.mutate(incident.id)} icon={<MagnifyingGlass size={14} />}>
+          Investigate
+        </Button>
+      )}
+      <Button size="sm" variant="secondary" onClick={() => setConfirming(true)} icon={<CheckCircle size={14} />}>
         Resolve
       </Button>
       {!compact && (
@@ -79,11 +137,20 @@ export function IncidentActions({ incident, compact }: { incident: Incident; com
           busy={mute.isPending}
           onClick={() => mute.mutate({ id: incident.id, minutes: muted ? 0 : 30 })}
           icon={<BellSlash size={14} />}
-          title={muted ? "Resume AWS notifications" : "Pause AWS notifications for 30 minutes"}
+          title={muted ? "Resume notifications" : "Pause notifications for 30 minutes"}
         >
           {muted ? "Unmute" : "Mute 30m"}
         </Button>
       )}
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        title={`Resolve incident #${incident.id}?`}
+        body={<>It moves to History and stops absorbing alerts. If the problem comes back, a new incident opens. Nothing is deleted: the evidence and timeline stay searchable.</>}
+        confirmLabel="Resolve incident"
+        busy={resolve.isPending}
+        onConfirm={() => resolve.mutate(incident.id, { onSettled: () => setConfirming(false) })}
+      />
     </div>
   );
 }
@@ -105,8 +172,8 @@ export function IncidentItem({ incident, now = Date.now() }: { incident: Inciden
             <span className="inline-flex items-center gap-1 text-[11px] text-fg-dim"><BellSlash size={12} /> muted</span>
           )}
         </div>
-        <Link to={`/app/anomalies/${incident.id}`} className="mt-2 block text-[14px] font-medium tracking-tight text-fg hover:text-signal">
-          {subjectOf(incident)}: {KIND_LABEL[incident.kind]}
+        <Link to={`/app/incidents/${incident.id}`} className="mt-2 block text-[14px] font-medium tracking-tight text-fg hover:text-signal">
+          {incident.title}
         </Link>
         <p className="mt-1 text-[12px] text-fg-dim">
           <span className="font-mono">#{incident.id}</span>
@@ -117,7 +184,7 @@ export function IncidentItem({ incident, now = Date.now() }: { incident: Inciden
       </div>
       <div className="flex shrink-0 flex-col items-end justify-between gap-2">
         <Link
-          to={`/app/anomalies/${incident.id}`}
+          to={`/app/incidents/${incident.id}`}
           className="inline-flex items-center gap-1 text-[12px] font-medium text-fg-muted transition-colors group-hover:text-signal"
         >
           Investigate <ArrowRight size={13} />
@@ -150,7 +217,7 @@ export function AlertRow({ alert, fresh }: { alert: Alert; fresh?: boolean }) {
     fresh && "animate-arrive",
   );
   const inner = alert.incident_id ? (
-    <Link to={`/app/anomalies/${alert.incident_id}`} className={className}>{body}</Link>
+    <Link to={`/app/incidents/${alert.incident_id}`} className={className}>{body}</Link>
   ) : (
     <div className={className}>{body}</div>
   );

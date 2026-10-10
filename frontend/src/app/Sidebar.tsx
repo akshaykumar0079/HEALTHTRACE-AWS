@@ -17,17 +17,22 @@ export function Sidebar({ collapsed, onToggle, onNavigate }: { collapsed: boolea
     <Tooltip.Provider delayDuration={200} disableHoverableContent>
       <nav aria-label="Primary" className="flex h-full flex-col">
         <div className={cx("flex h-16 items-center", collapsed ? "justify-center px-0" : "px-5")}>
-          <NavLink to="/" className="flex items-center gap-2.5 rounded-lg" aria-label="HEALTH TRACE home">
+          <NavLink to="/" className="flex items-center gap-2.5 rounded-lg" aria-label="HEALTHTRACE home">
             <Logo size={26} />
-            {!collapsed && <span className="text-[13.5px] font-semibold tracking-[0.14em] text-fg">HEALTH TRACE</span>}
+            {!collapsed && <span className="text-[13.5px] font-semibold tracking-[0.14em] text-fg">HEALTHTRACE</span>}
           </NavLink>
         </div>
 
         <div className="flex-1 overflow-y-auto px-3 pb-4">
-          {(["observe", "platform"] as const).map((group) => (
-            <ul key={group} className={cx("space-y-0.5", group === "platform" && "mt-6 border-t border-[var(--hairline)] pt-4")}>
+          {(["main", "tools"] as const).map((group) => (
+            <ul
+              key={group}
+              aria-label={group === "tools" ? "Diagnostics" : undefined}
+              className={cx("space-y-0.5", group === "tools" && "mt-6 border-t border-[var(--hairline)] pt-4")}
+            >
+              {group === "tools" && !collapsed && <li className="px-3 pb-1 text-[10.5px] font-medium uppercase tracking-[0.14em] text-fg-dim">Diagnostics</li>}
               {NAV.filter((n) => n.group === group).map((item) => {
-                const badge = item.to === "/app/anomalies" && active.length > 0 ? active.length : null;
+                const badge = item.to === "/app/incidents" && active.length > 0 ? active.length : null;
                 const link = (
                   <NavLink
                     to={item.to}
@@ -67,7 +72,7 @@ export function Sidebar({ collapsed, onToggle, onNavigate }: { collapsed: boolea
                               color: worst ? SEVERITY_HEX[worst] : undefined,
                               background: worst ? `${SEVERITY_HEX[worst]}${collapsed ? "" : "1c"}` : undefined,
                             }}
-                            aria-label={`${badge} active anomalies`}
+                            aria-label={`${badge} active incidents`}
                           >
                             {collapsed ? "" : badge}
                           </span>

@@ -96,7 +96,7 @@ class Anomaly(BaseModel):
 
 
 Severity = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-IncidentState = Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"]
+IncidentState = Literal["OPEN", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED"]
 
 
 class Alert(BaseModel):
@@ -129,12 +129,23 @@ class Incident(BaseModel):
     acknowledged_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     mttr_seconds: Optional[float] = None
-    # Transient (not persisted): external notifications suppressed until then.
+    # External notifications suppressed until then (persisted so a restart keeps the mute).
     muted_until: Optional[datetime] = None
+    # Workflow fields. Pinning is purely an organisational flag: it never
+    # changes severity, risk score or status.
+    pinned: bool = False
+    pinned_at: Optional[datetime] = None
+    investigating_at: Optional[datetime] = None
+    # Newest alert attached to this incident (what the UI shows as "last seen").
+    last_seen_at: Optional[datetime] = None
+    # Highest real detector score among attached alerts; None for rule-based
+    # (HIPAA) detections, which have no continuous score. Never fabricated.
+    peak_score: Optional[float] = None
 
 
 IncidentEventType = Literal[
-    "opened", "alert_attached", "escalated", "acknowledged", "resolved", "auto_resolved", "muted"
+    "opened", "alert_attached", "escalated", "acknowledged", "investigating", "resolved", "auto_resolved",
+    "muted", "pinned", "unpinned",
 ]
 
 

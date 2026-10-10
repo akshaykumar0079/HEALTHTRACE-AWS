@@ -1,0 +1,36 @@
+# Render Blueprint - backend only (API + WebSocket). The frontend goes to Vercel.
+# Secrets use `sync: false`: Render asks for them in its dashboard; they are
+# never stored in this file or in git.
+services:
+  - type: web
+    name: healthtrace-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATA_SOURCE
+        value: simulated
+      - key: AWS_MODE
+        value: "off"
+      - key: EMBEDDED_GENERATOR
+        value: "true"
+      - key: EMBEDDED_RATE
+        value: "10"
+      - key: METRICS_PERSIST_INTERVAL_SECONDS
+        value: "60"
+      - key: EMAIL_ENABLED
+        value: "false"
+      - key: EMAIL_PROVIDER
+        value: brevo
+      - key: DATABASE_URL        # Neon (or any Postgres) connection string
+        sync: false
+      - key: OPERATOR_TOKEN      # you choose a long random value
+        sync: false
+      - key: CORS_ORIGINS        # your Vercel site origin, e.g. https://<name>.vercel.app
+        sync: false
+      - key: BREVO_API_KEY       # optional; only needed to send real email
+        sync: false

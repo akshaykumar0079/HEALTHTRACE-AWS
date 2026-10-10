@@ -74,7 +74,9 @@ export function StateBadge({ state }: { state: IncidentState }) {
       ? "text-fg bg-ink-700"
       : state === "ACKNOWLEDGED"
         ? "text-sev-medium bg-[#e3b35a12]"
-        : "text-fg-dim bg-ink-800";
+        : state === "INVESTIGATING"
+          ? "text-signal bg-[#56dcc812]"
+          : "text-fg-dim bg-ink-800";
   return (
     <span className={cx("inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-medium", tone)}>
       {STATE_LABEL[state]}
