@@ -41,9 +41,9 @@ function Rows({ rows }: { rows: [string, ReactNode, string?][] }) {
   return (
     <dl className="divide-y divide-[var(--hairline)]">
       {rows.map(([k, v, hint]) => (
-        <div key={k} className="grid gap-1 py-3 sm:grid-cols-[220px_140px_1fr] sm:items-baseline sm:gap-4">
+        <div key={k} className="grid grid-cols-[minmax(0,1fr)] gap-1 py-3 sm:grid-cols-[220px_140px_minmax(0,1fr)] sm:items-baseline sm:gap-4">
           <dt className="text-[13px] text-fg-muted">{k}</dt>
-          <dd className="font-mono text-[13px] text-fg">{v}</dd>
+          <dd className="min-w-0 break-all font-mono text-[13px] text-fg">{v}</dd>
           {hint && <dd className="text-[12px] leading-relaxed text-fg-dim">{hint}</dd>}
         </div>
       ))}
@@ -127,7 +127,7 @@ export default function Settings() {
           Notification settings below are editable and saved in the database. Detection settings come from <span className="font-mono text-fg">config.yaml</span> and deployment settings from environment variables, both read at startup. They are shown read-only so the numbers you see are the numbers in force.
         </p>
       </div>
-      <div className="grid gap-8 lg:grid-cols-[180px_minmax(0,1fr)]">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-8 lg:grid-cols-[180px_minmax(0,1fr)]">
         <nav aria-label="Settings sections" className="hidden lg:block">
           <ul className="sticky top-24 space-y-0.5">
             {SECTIONS.map(([id, label]) => (

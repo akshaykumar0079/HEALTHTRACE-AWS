@@ -78,6 +78,37 @@ committed. If Brevo is unreachable HEALTHTRACE logs the reason, retries up to
 Plain SMTP (e.g. Gmail with an App Password) still works with
 `EMAIL_PROVIDER=smtp` and the `SMTP_*` settings in `.env.example`.
 
+## Investigation, simulation and privacy features
+
+| Feature | Where | Doc |
+|---|---|---|
+| Incident Time Machine (persisted timeline, windows, read-only replay, baseline vs observed, raw synthetic evidence, explicit missing/expired history) | Incident page | [incident-grouping](docs/incident-grouping.md) |
+| Grouping, dedupe, cooldown, escalation, reopen, pin, risk trend, evidence quality | Incidents | [incident-grouping](docs/incident-grouping.md) |
+| Safe simulator with fixed seeds, detection delay and false-positive reporting | Simulator page | [simulator](docs/simulator.md) |
+| Cross-source correlation (shared-key rules, synthetic adapters only) | Incident page | [correlation](docs/correlation.md) |
+| Redaction, retention, viewer/operator/admin roles, audit log, auth-disabled warnings | Settings | [privacy-and-retention](docs/privacy-and-retention.md) |
+
+**Limits (read these):** synthetic data only; no compliance claim (not HIPAA
+certified); static shared-secret roles, not real sign-in; server and DB-audit
+correlation adapters accept synthetic formats only; the detector misses some
+mild degradations and the simulator control run shows a false positive
+(see the benchmark in [docs/simulator.md](docs/simulator.md)); local defaults
+have **no authentication**, and the dashboard says so.
+
+**Investigation workflow:** open an incident -> read the explanation (rule,
+threshold, observed vs baseline) -> step through the Time Machine, selecting
+entries to see raw synthetic records -> check correlated events -> acknowledge /
+investigate -> resolve (or reopen if it recurs). Pin to keep it findable.
+
+**Simulator:** open *Simulator*, pick a scenario and seed, press Run. Nothing
+touches your real data or sends email. API: `POST /api/simulations/run`.
+
+**Security checklist before any shared deployment:** set `OPERATOR_TOKEN`,
+`ADMIN_TOKEN`, `VIEWER_TOKEN` (+ `REQUIRE_VIEW_AUTH=true`) to random values;
+set `ENVIRONMENT=production`; keep redaction on; restrict `CORS_ORIGINS`; serve
+over HTTPS behind real sign-in; review retention; back up before migrating;
+never commit `.env`; confirm `/api/security/status` shows no warnings.
+
 ## Dashboard
 
 Overview, Incidents (grouped, with severity, risk score, status, pin),
@@ -101,8 +132,9 @@ not deployed), [docs/hospital-readiness.md](docs/hospital-readiness.md) and
 ## Tests
 
 ```bash
-python -m pytest backend/tests -q      # run; PostgreSQL cases need HEALTHTRACE_TEST_DATABASE_URL
-cd frontend && npm run build           # typecheck + production build
+python -m pytest backend/tests -q      # PostgreSQL cases need HEALTHTRACE_TEST_DATABASE_URL
+cd frontend && npm test                # vitest
+cd frontend && npm run typecheck && npm run lint && npm run build
 ```
 
 ## Demo script
@@ -119,6 +151,10 @@ cd frontend && npm run build           # typecheck + production build
 
 ## Documentation
 
+- [Incident grouping and Time Machine](docs/incident-grouping.md)
+- [Simulator](docs/simulator.md)
+- [Correlation](docs/correlation.md)
+- [Privacy, retention, roles](docs/privacy-and-retention.md)
 - [Architecture](docs/architecture.md)
 - [Backend](docs/backend.md) and the [changes made during stabilisation](docs/backend.md#stabilisation-log)
 - [Real-time events](docs/realtime.md)
@@ -143,4 +179,5 @@ environment variables (see `.env.example`): `AWS_MODE` (off | mock | live),
 `PROJECT_NAME`, `ENVIRONMENT`, `CORS_ORIGINS`, `OPERATOR_TOKEN`, `LOG_DIR`,
 `DB_PATH`, `DATABASE_URL`, `EMAIL_MIN_SEVERITY`, `EMAIL_COOLDOWN_SECONDS`,
 `DATA_SOURCE`, `REQUIRE_OPERATOR_TOKEN`, `EMBEDDED_GENERATOR`,
-`METRICS_PERSIST_INTERVAL_SECONDS`.
+`METRICS_PERSIST_INTERVAL_SECONDS`, `VIEWER_TOKEN`, `ADMIN_TOKEN`, `REQUIRE_VIEW_AUTH`,
+`REDACTION_ENABLED`, `REDACT_EXTRA_FIELDS`, `REDACT_EXTRA_PATTERNS`, `RETENTION_*_DAYS`, `RETENTION_INTERVAL_HOURS`.
