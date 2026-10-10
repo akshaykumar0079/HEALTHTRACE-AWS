@@ -55,6 +55,36 @@ export function RiskScore({ incident }: { incident: Incident }) {
   );
 }
 
+const TREND_META = {
+  rising: { symbol: "↗", label: "Risk rising", color: "var(--color-sev-high)" },
+  falling: { symbol: "↘", label: "Risk falling", color: "var(--color-signal)" },
+  stable: { symbol: "→", label: "Risk stable", color: "var(--color-fg-muted)" },
+  unknown: { symbol: "·", label: "Trend unknown", color: "var(--color-fg-dim)" },
+} as const;
+
+/** Direction of recent risk. Text and an arrow, never colour alone. Trend is not severity. */
+export function TrendChip({ incident }: { incident: Incident }) {
+  const t = TREND_META[incident.risk_trend ?? "unknown"];
+  return (
+    <span className="inline-flex items-center gap-1 text-[12px]" style={{ color: t.color }} title={incident.risk_trend_basis ? `Based on ${incident.risk_trend_basis}` : undefined}>
+      <span aria-hidden>{t.symbol}</span>
+      <span>{t.label}</span>
+    </span>
+  );
+}
+
+const QUALITY_LABEL = { none: "No evidence", limited: "Limited evidence", moderate: "Moderate evidence", strong: "Strong evidence" } as const;
+
+/** How much stored evidence backs the incident. Separate from severity and risk score. */
+export function EvidenceQualityChip({ quality, count }: { quality?: Incident["evidence_quality"]; count?: number }) {
+  const q = quality ?? "none";
+  return (
+    <span className="text-[12px] text-fg-muted" title="Evidence quality counts the stored log records; it is not severity or risk.">
+      {QUALITY_LABEL[q]}{count ? ` (${count})` : ""}
+    </span>
+  );
+}
+
 function useDebounced<T>(value: T, ms: number): T {
   const [v, setV] = useState(value);
   useEffect(() => {
@@ -134,9 +164,14 @@ export function IncidentTable({ preset }: { preset: IncidentPreset }) {
   const sort = params.get("sort") ?? "priority";
   const pinnedOnly = preset === "pinned" || params.get("pinned") === "1";
   const within = params.get("within") ?? "";
+  const service = params.get("service") ?? "";
+  const source = (params.get("source") ?? "") as "" | "app" | "audit" | "auth";
+  const config = useQuery({ queryKey: ["config"], queryFn: api.config, staleTime: 60_000 });
+  const serviceNames = Object.keys(config.data?.detection.services ?? {});
 
   const query: IncidentSearchParams = useMemo(() => {
-    const base: IncidentSearchParams = { q: q || undefined, sort, limit, severity: severities.join(",") || undefined };
+    const base: IncidentSearchParams = { q: q || undefined, sort, limit, severity: severities.join(",") || undefined, service: service || undefined, source: source || undefined };
+    if (preset !== "history" && within) base.since_hours = Number(within);
     if (preset === "history") {
       base.status = "RESOLVED";
       if (within) base.since_hours = Number(within);
@@ -150,7 +185,7 @@ export function IncidentTable({ preset }: { preset: IncidentPreset }) {
     }
     return base;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [preset, q, sort, limit, params, within]);
+  }, [preset, q, sort, limit, params, within, service, source]);
 
   useLiveIncidentRefresh();
   const { data, error, isLoading, isFetching, refetch } = useQuery({
@@ -162,7 +197,7 @@ export function IncidentTable({ preset }: { preset: IncidentPreset }) {
   const toggle = (key: "severity" | "status", value: string, current: string[]) =>
     setParam(key, (current.includes(value) ? current.filter((v) => v !== value) : [...current, value]).join(",") || null);
 
-  const filtered = !!(q || severities.length || statuses.length || within || (preset !== "pinned" && pinnedOnly));
+  const filtered = !!(q || severities.length || statuses.length || within || service || source || (preset !== "pinned" && pinnedOnly));
   const statusChoices = preset === "active" ? STATES.filter((s) => s !== "RESOLVED") : STATES;
 
   return (
@@ -242,14 +277,30 @@ export function IncidentTable({ preset }: { preset: IncidentPreset }) {
             </fieldset>
           )}
 
-          {preset === "history" && (
-            <div>
-              <label htmlFor="history-window" className="mb-1.5 block text-[11.5px] text-fg-dim">Resolved within</label>
-              <select id="history-window" value={within} onChange={(e) => setParam("within", e.target.value || null)} className={cx(inputClass, "w-44")}>
-                {HISTORY_WINDOWS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-              </select>
-            </div>
-          )}
+          <div>
+            <label htmlFor="history-window" className="mb-1.5 block text-[11.5px] text-fg-dim">{preset === "history" ? "Resolved within" : "Seen within"}</label>
+            <select id="history-window" value={within} onChange={(e) => setParam("within", e.target.value || null)} className={cx(inputClass, "w-44")}>
+              {HISTORY_WINDOWS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="incident-source" className="mb-1.5 block text-[11.5px] text-fg-dim">Log source</label>
+            <select id="incident-source" value={source} onChange={(e) => setParam("source", e.target.value || null)} className={cx(inputClass, "w-44")}>
+              <option value="">All sources</option>
+              <option value="app">Application</option>
+              <option value="audit">PHI access audit</option>
+              <option value="auth">Authentication</option>
+            </select>
+          </div>
+
+          <div>
+            <label htmlFor="incident-service" className="mb-1.5 block text-[11.5px] text-fg-dim">Service</label>
+            <select id="incident-service" value={service} onChange={(e) => setParam("service", e.target.value || null)} className={cx(inputClass, "w-44")}>
+              <option value="">All services</option>
+              {serviceNames.map((name) => <option key={name} value={name}>{config.data?.detection.services[name]?.label ?? name}</option>)}
+            </select>
+          </div>
 
           {(preset === "active" || preset === "all") && (
             <button
@@ -339,6 +390,7 @@ export function IncidentRows({ items, showActions = true, dense }: { items: Inci
               <th scope="col" className="px-2 py-2.5 font-medium">Incident</th>
               <th scope="col" className="px-2 py-2.5 font-medium">Severity</th>
               <th scope="col" className="px-2 py-2.5 font-medium">Risk score</th>
+              {!dense && <th scope="col" className="px-2 py-2.5 font-medium">Trend</th>}
               <th scope="col" className="px-2 py-2.5 font-medium">Status</th>
               {!dense && <th scope="col" className="px-2 py-2.5 font-medium">First seen</th>}
               <th scope="col" className="px-2 py-2.5 font-medium">Last seen</th>
@@ -355,10 +407,11 @@ export function IncidentRows({ items, showActions = true, dense }: { items: Inci
                 <td className="px-2 py-3 font-mono text-fg-muted">#{i.id}</td>
                 <td className="max-w-[320px] px-2 py-3">
                   <Link to={`/app/incidents/${i.id}`} className="block truncate font-medium text-fg hover:text-signal">{i.title}</Link>
-                  <span className="block truncate text-[11.5px] text-fg-dim">Source: {i.source}</span>
+                  <span className="block truncate text-[11.5px] text-fg-dim">Source: {i.source} · <EvidenceQualityChip quality={i.evidence_quality} count={i.evidence_count} />{i.reopen_count ? ` · reopened ${i.reopen_count}x` : ""}</span>
                 </td>
                 <td className="px-2 py-3"><SeverityBadge severity={i.severity} size="sm" /></td>
                 <td className="px-2 py-3"><RiskScore incident={i} /></td>
+                {!dense && <td className="px-2 py-3"><TrendChip incident={i} /></td>}
                 <td className="px-2 py-3"><StateBadge state={i.state} /></td>
                 {!dense && <td className="whitespace-nowrap px-2 py-3 text-fg-muted" title={stamp(i.first_seen_at)}>{ago(i.first_seen_at, now)}</td>}
                 <td className="whitespace-nowrap px-2 py-3 text-fg-muted" title={stamp(i.last_seen_at)}>{ago(i.last_seen_at, now)}</td>
@@ -390,6 +443,8 @@ export function IncidentRows({ items, showActions = true, dense }: { items: Inci
               <div><dt className="text-fg-dim">First seen</dt><dd className="text-fg-muted">{ago(i.first_seen_at, now)}</dd></div>
               <div><dt className="text-fg-dim">Last seen</dt><dd className="text-fg-muted">{ago(i.last_seen_at, now)}</dd></div>
               <div><dt className="text-fg-dim">Occurrences</dt><dd className="font-mono text-fg">{i.occurrence_count}</dd></div>
+              <div><dt className="text-fg-dim">Risk trend</dt><dd><TrendChip incident={i} /></dd></div>
+              <div><dt className="text-fg-dim">Evidence</dt><dd><EvidenceQualityChip quality={i.evidence_quality} count={i.evidence_count} /></dd></div>
             </dl>
             {showActions && <IncidentActions incident={i} compact />}
           </li>

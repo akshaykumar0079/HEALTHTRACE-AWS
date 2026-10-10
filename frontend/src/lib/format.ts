@@ -26,6 +26,7 @@ export const KIND_LABEL: Record<AnomalyKind, string> = {
   hipaa_bulk_export: "Bulk record export",
   hipaa_off_hours: "Off-hours access",
   hipaa_region_mismatch: "Cross-region access",
+  auth_suspicious_login: "Suspicious login",
 };
 
 export const STATE_LABEL: Record<IncidentState, string> = {
@@ -38,6 +39,8 @@ export const STATE_LABEL: Record<IncidentState, string> = {
 export const STATES: IncidentState[] = ["OPEN", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED"];
 
 export const isHipaaKind = (kind: AnomalyKind) => kind.startsWith("hipaa_");
+/** Rule-based detections have no statistical score; the UI shows a dash, never an invented number. */
+export const isRuleBasedKind = (kind: AnomalyKind) => kind.startsWith("hipaa_") || kind.startsWith("auth_");
 
 const FALLBACK_LABELS: Record<string, string> = {
   prior_auth: "Prior Authorization",

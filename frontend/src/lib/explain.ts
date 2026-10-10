@@ -112,6 +112,21 @@ export function explain(alert: Alert, rule: DetectionRule): Explanation {
         checks: [{ label: "Patient region differs from user region", passed: true, detail: `${num(patients)} patients` }],
       };
     }
+    case "auth_suspicious_login": {
+      const failures = n(m.failures) ?? 0;
+      const threshold = n(m.failure_threshold) ?? rule.failure_threshold ?? 5;
+      const flag: unknown = m.unfamiliar_region;
+      const unfamiliar = flag === true || flag === "true";
+      return {
+        current: { label: "Failed logins before success", value: num(failures), detail: `for ${alert.user_id}, then a successful login from ${String(m.success_region ?? "unknown region")}` },
+        normal: { label: "Normal behaviour", value: `< ${num(threshold)}`, detail: `staff rarely fail ${num(threshold)} logins in a row; home region is ${String(m.user_region ?? "unknown")}` },
+        rule: { label: "Detection rule", value: `≥ ${num(threshold)} failures`, detail: `then a success within ${rule.window_minutes ?? 10} minutes; more serious from an unfamiliar region` },
+        checks: [
+          { label: `At least ${num(threshold)} failed logins`, passed: failures >= threshold, detail: `${num(failures)} failures` },
+          { label: "Success from an unfamiliar region", passed: unfamiliar, detail: unfamiliar ? "yes" : "no" },
+        ],
+      };
+    }
     default:
       return {
         current: { label: "Current", value: "-", detail: "" },
@@ -183,6 +198,12 @@ export function nextSteps(incident: Incident, config?: AppConfigResponse): strin
       return [
         `Check whether ${incident.user_id} was covering another region's caseload.`,
         "Repeated cross-region access without an assignment is a potential privacy violation.",
+      ];
+    case "auth_suspicious_login":
+      return [
+        `Contact ${incident.user_id} through a known channel to confirm they made the successful login.`,
+        "If they did not, reset the credential, revoke active sessions and review what the account accessed afterwards (see cross-system links below).",
+        "Record the outcome before resolving, so the review is traceable.",
       ];
   }
 }

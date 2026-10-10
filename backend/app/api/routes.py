@@ -36,6 +36,11 @@ _SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 _SEVERITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 _STATES = {"OPEN", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED"}
 _ACTIVE = ("OPEN", "ACKNOWLEDGED", "INVESTIGATING")
+_SOURCE_KINDS = {
+    "app": ("error_rate", "latency_degradation"),
+    "audit": ("hipaa_bulk_access", "hipaa_bulk_export", "hipaa_off_hours", "hipaa_region_mismatch"),
+    "auth": ("auth_suspicious_login",),
+}
 _SORTS = {"priority", "recent", "opened", "severity", "risk", "occurrences"}
 
 logger = logging.getLogger(__name__)
@@ -182,6 +187,7 @@ async def search_incidents(
     severity: Optional[str] = Query(default=None, description="comma list of LOW,MEDIUM,HIGH,CRITICAL"),
     pinned: Optional[bool] = None,
     service: Optional[str] = Query(default=None, max_length=64),
+    source: Optional[Literal["app", "audit", "auth"]] = Query(default=None, description="log source the detection reads"),
     q: Optional[str] = Query(default=None, max_length=100),
     since_hours: Optional[int] = Query(default=None, ge=1, le=24 * 365, description="only incidents seen/resolved within this many hours"),
     sort: str = "priority",
@@ -200,6 +206,7 @@ async def search_incidents(
     text = (q or "").strip().lower()
     rows = await pipeline.store.query_incidents(
         states=states or None, severities=severities or None, service=service or None, pinned=pinned, limit=5000,
+        kinds=list(_SOURCE_KINDS[source]) if source else None,
     )
     # The engine's in-memory copy is authoritative for incidents it tracks (and
     # may not be persisted yet); every filter is then applied once, here.
@@ -216,6 +223,8 @@ async def search_incidents(
         items = [i for i in items if i.pinned == pinned]
     if service:
         items = [i for i in items if i.service == service]
+    if source:
+        items = [i for i in items if i.kind in _SOURCE_KINDS[source]]
     if since_hours:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
         items = [i for i in items if (i.resolved_at or i.last_seen_at or i.opened_at) >= cutoff]

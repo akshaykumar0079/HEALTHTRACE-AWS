@@ -9,6 +9,7 @@ import { Button, ErrorState, Field, PageHeader, Panel, Skeleton, cx, inputClass 
 import { toast } from "@/app/toast";
 import { NotificationSettings } from "@/components/NotificationSettings";
 import { AwsIntegration } from "@/components/AwsIntegration";
+import { SecurityPrivacy } from "@/components/Security";
 
 const SECTIONS = [
   ["general", "General"],
@@ -20,6 +21,7 @@ const SECTIONS = [
   ["realtime", "Real-time"],
   ["aws", "AWS"],
   ["access", "API access"],
+  ["privacy", "Privacy & security"],
   ["routing", "Alert routing"],
 ] as const;
 
@@ -207,6 +209,9 @@ export default function Settings() {
           </Section>
           <Section id="access" title="API access" description="Read endpoints are open to anyone who can reach the app; put sign-in (ALB with Cognito) in front of it in production.">
             <OperatorToken required={dep.operator_token_required} />
+          </Section>
+          <Section id="privacy" title="Privacy & security" description="Redaction, retention, roles and what has not been verified. These controls reduce risk; they are not a compliance certification.">
+            <SecurityPrivacy />
           </Section>
           <Section id="routing" title="Alert routing" description="How detections reach AWS. Email is configured under Notifications above.">
             <Rows rows={[

@@ -68,6 +68,14 @@ export function useIncidentActions() {
     },
     onError: onError("resolve"),
   });
+  const reopen = useMutation({
+    mutationFn: api.reopen,
+    onSuccess: (inc) => {
+      refresh(inc);
+      toast.success("Reopened", `Incident #${inc.id} is active again and keeps its history.`);
+    },
+    onError: onError("reopen"),
+  });
   const mute = useMutation({
     mutationFn: ({ id, minutes }: { id: number; minutes: number }) => api.mute(id, minutes),
     onSuccess: (inc) => {
@@ -85,7 +93,7 @@ export function useIncidentActions() {
     },
     onError: onError("change the pin"),
   });
-  return { ack, investigate, resolve, mute, pin };
+  return { ack, investigate, resolve, reopen, mute, pin };
 }
 
 export function PinButton({ incident, className }: { incident: Incident; className?: string }) {
@@ -110,9 +118,20 @@ export function PinButton({ incident, className }: { incident: Incident; classNa
 }
 
 export function IncidentActions({ incident, compact }: { incident: Incident; compact?: boolean }) {
-  const { ack, investigate, resolve, mute } = useIncidentActions();
+  const { ack, investigate, resolve, reopen, mute } = useIncidentActions();
   const [confirming, setConfirming] = useState(false);
-  if (incident.state === "RESOLVED") return <PinButton incident={incident} />;
+  if (incident.state === "RESOLVED") {
+    return (
+      <div className="flex flex-wrap items-center gap-1.5">
+        <PinButton incident={incident} />
+        {!compact && (
+          <Button size="sm" variant="secondary" busy={reopen.isPending} onClick={() => reopen.mutate(incident.id)} title="Reopen this incident if the problem has returned">
+            Reopen
+          </Button>
+        )}
+      </div>
+    );
+  }
   const muted = incident.muted_until && new Date(incident.muted_until).getTime() > Date.now();
   return (
     <div className="flex flex-wrap items-center gap-1.5">

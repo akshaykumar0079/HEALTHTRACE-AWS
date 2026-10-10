@@ -8,6 +8,7 @@ import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "./Toaster";
 import { startLive, useLive } from "@/lib/live";
 import { SkeletonRows, cx } from "@/components/ui";
+import { SecurityBanner } from "@/components/Security";
 
 const COLLAPSE_KEY = "healthtrace.sidebarCollapsed";
 
@@ -91,6 +92,7 @@ export default function AppShell() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <Topbar onMenu={() => setMobileNav(true)} onSearch={() => setPalette(true)} />
+        <SecurityBanner />
         <ReplayBanner />
         <main id="main" className="relative flex-1">
           <AnimatePresence mode="wait" initial={false}>

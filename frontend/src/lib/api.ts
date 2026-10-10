@@ -3,6 +3,8 @@ import type {
   Alert,
   Analytics,
   AppConfigResponse,
+  BenchmarkResult,
+  CorrelationResult,
   AwsCheckResult,
   AwsStatus,
   EmailStatus,
@@ -19,6 +21,13 @@ import type {
   SystemStatus,
   TestEmailResult,
   LogContext,
+  MeResponse,
+  SecurityStatus,
+  SimResult,
+  SimRunRow,
+  SimScenario,
+  TimelineEntryDetail,
+  TimelineResponse,
   LogSearchResult,
   ServiceDetail,
   ServiceRow,
@@ -39,9 +48,10 @@ export const API_BASE: string = ((import.meta.env.VITE_API_BASE_URL as string | 
 export function wsUrl(): string {
   const explicit = (import.meta.env.VITE_WS_URL as string | undefined)?.trim();
   if (explicit) return explicit;
-  if (API_BASE) return API_BASE.replace(/^http/, "ws") + "/ws";
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws`;
+  const base = API_BASE ? API_BASE.replace(/^http/, "ws") + "/ws" : `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
+  // A browser WebSocket cannot send headers, so a configured token travels as a query parameter.
+  const token = getOperatorToken();
+  return token ? `${base}${base.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}` : base;
 }
 
 export function getOperatorToken(): string {
@@ -143,6 +153,24 @@ export const api = {
   emailStatus: () => request<EmailStatus>("/notifications/email"),
   awsTestConnection: () => request<AwsCheckResult>("/aws/test-connection", { method: "POST" }),
   awsTestAlert: () => request<AwsCheckResult>("/aws/test-alert", { method: "POST" }),
+  me: () => request<MeResponse>("/me"),
+  retentionPreview: () => request<{ policy: unknown; would_delete: Record<string, number>; last_run: unknown }>("/admin/retention"),
+  runRetention: () => request<{ ran_at: string; dry_run: boolean; deleted: Record<string, number>; error: string | null }>("/admin/retention/run", { method: "POST" }),
+  securityStatus: () => request<SecurityStatus>("/security/status"),
+  timeline: (id: number, p: { before_minutes?: number; after_minutes?: number; sources?: string; as_of?: string } = {}) =>
+    request<TimelineResponse>(`/incidents/${id}/timeline${qs(p)}`),
+  timelineEntry: (id: number, entryId: string) =>
+    request<TimelineEntryDetail>(`/incidents/${id}/timeline/${encodeURIComponent(entryId).replace(/%3A/g, ":")}`),
+  reopen: (id: number) => request<Incident>(`/incidents/${id}/reopen`, { method: "POST" }),
+  correlation: (id: number, windowMinutes = 15) =>
+    request<CorrelationResult>(`/incidents/${id}/correlation${qs({ window_minutes: windowMinutes })}`),
+  simScenarios: () => request<{ scenarios: SimScenario[]; synthetic_only: true; note: string }>("/simulations/scenarios"),
+  simRuns: (limit = 20) => request<{ items: SimRunRow[] }>(`/simulations/runs${qs({ limit })}`),
+  simRun: (id: number) => request<{ id: number; result: SimResult }>(`/simulations/runs/${id}`),
+  runSimulation: (scenario_id: string, seed?: number) =>
+    request<SimResult & { id: number }>("/simulations/run", { method: "POST", body: JSON.stringify({ scenario_id, seed }) }),
+  runBenchmark: (seeds: number[]) =>
+    request<BenchmarkResult>("/simulations/benchmark", { method: "POST", body: JSON.stringify({ seeds }) }),
   scenarios: () => request<{ enabled: boolean; scenarios: DemoScenario[] }>("/demo/scenarios"),
   inject: (scenario: string, duration_s: number) =>
     request<{ scenario: string; duration_s: number }>("/demo/inject", {

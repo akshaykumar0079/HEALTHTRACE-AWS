@@ -40,8 +40,10 @@ import { MIN_STD, Z_THRESHOLD } from "@/lib/series";
 import { Bezel, EmptyState, ErrorState, Panel, PanelHeader, SeverityBadge, Skeleton, StateBadge, cx } from "@/components/ui";
 import { TimeSeries, type TsPoint } from "@/components/charts";
 import { IncidentActions, LogLine } from "@/components/domain";
-import { RiskScore } from "@/components/IncidentTable";
+import { EvidenceQualityChip, RiskScore, TrendChip } from "@/components/IncidentTable";
 import TelemetryCanvas from "@/three/TelemetryCanvas";
+import { TimeMachine } from "@/components/TimeMachine";
+import { CorrelationPanel } from "@/components/CorrelationPanel";
 
 const EVENT_META: Record<IncidentEvent["event_type"], { label: string; icon: typeof Circle }> = {
   opened: { label: "Anomaly opened", icon: Siren },
@@ -54,6 +56,7 @@ const EVENT_META: Record<IncidentEvent["event_type"], { label: string; icon: typ
   resolved: { label: "Resolved by operator", icon: CheckCircle },
   auto_resolved: { label: "Resolved automatically", icon: CheckCircle },
   muted: { label: "Notifications changed", icon: BellSimpleRinging },
+  reopened: { label: "Reopened by a recurrence", icon: Siren },
 };
 
 function peakAlert(alerts: Alert[]): Alert | undefined {
@@ -86,6 +89,18 @@ function KeyFigures({ detail, alert }: { detail: IncidentDetail; alert: Alert })
         <Figure label={alert.kind === "hipaa_bulk_export" || alert.kind === "hipaa_off_hours" ? "Records" : "Patients"} value={num(main)} color={color} />
         {num_("multiplier") != null && <Figure label="Versus baseline" value={`${(num_("multiplier") as number).toFixed(1)}x`} />}
         <Figure label="Window" value="10 min" sub="rolling, per user" />
+        <Figure label="Alerts" value={num(detail.incident.alert_count)} sub={`over ${duration(elapsed(detail))}`} />
+      </div>
+    );
+  }
+  if (alert.kind === "auth_suspicious_login") {
+    const text = (k: string) => (typeof m[k] === "string" ? (m[k] as string) : "-");
+    const unfamiliar: unknown = m.unfamiliar_region;
+    return (
+      <div className="grid grid-cols-2 gap-6 sm:grid-cols-4">
+        <Figure label="Failed logins" value={num(num_("failures") ?? 0)} color={color} sub={`threshold ${num(num_("failure_threshold") ?? 5)}`} />
+        <Figure label="Success from" value={text("success_region")} sub={`home region ${text("user_region")}`} />
+        <Figure label="Unfamiliar region" value={unfamiliar === true || unfamiliar === "true" ? "Yes" : "No"} />
         <Figure label="Alerts" value={num(detail.incident.alert_count)} sub={`over ${duration(elapsed(detail))}`} />
       </div>
     );
@@ -408,6 +423,12 @@ export default function Investigation() {
                 <StateBadge state={inc.state} />
                 <span className="font-mono text-[12px] text-fg-dim">#{inc.id}</span>
                 <span className="inline-flex items-center gap-1.5 text-[12px] text-fg-muted">Risk score <RiskScore incident={inc} /></span>
+                <TrendChip incident={inc} />
+                <span className="text-[12px] text-fg-muted" title={inc.grouping?.explanation}>
+                  {inc.occurrence_count} occurrence{inc.occurrence_count === 1 ? "" : "s"}
+                  {inc.reopen_count ? `, reopened ${inc.reopen_count}x` : ""}
+                </span>
+                <EvidenceQualityChip quality={inc.evidence_quality} count={inc.evidence_count} />
                 {inc.pinned && <span className="inline-flex items-center gap-1 rounded-full bg-[#56dcc812] px-2.5 py-1 text-[11px] font-medium text-signal"><PushPin size={11} weight="fill" /> Pinned</span>}
               </div>
               <h1 className="mt-4 text-[28px] font-semibold leading-[1.1] tracking-[-0.025em] text-fg md:text-[36px]">
@@ -468,6 +489,10 @@ export default function Investigation() {
           <Delivery detail={detail} />
         </motion.div>
       </div>
+
+      <motion.div {...fade(4)}><TimeMachine incidentId={incidentId} state={inc.state} /></motion.div>
+
+      <CorrelationPanel incidentId={incidentId} />
 
       <Panel>
         <PanelHeader

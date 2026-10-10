@@ -8,7 +8,8 @@ export type AnomalyKind =
   | "hipaa_bulk_access"
   | "hipaa_off_hours"
   | "hipaa_region_mismatch"
-  | "hipaa_bulk_export";
+  | "hipaa_bulk_export"
+  | "auth_suspicious_login";
 
 export interface WindowMetrics {
   service: string;
@@ -94,7 +95,18 @@ export interface Incident {
   /** The detector's own 0-100 score. null for rule-based (HIPAA) detections: never invented. */
   risk_score: number | null;
   risk_basis: string;
+  /** Grouping, trend and evidence fields added by the investigation backend. */
+  latest_score?: number | null;
+  risk_trend?: RiskTrend;
+  risk_trend_basis?: string;
+  reopen_count?: number;
+  evidence_count?: number;
+  evidence_quality?: EvidenceQuality;
+  grouping?: { rule: string; key: string; explanation: string };
 }
+
+export type RiskTrend = "rising" | "falling" | "stable" | "unknown";
+export type EvidenceQuality = "none" | "limited" | "moderate" | "strong";
 
 export type IncidentEventType =
   | "opened"
@@ -106,7 +118,8 @@ export type IncidentEventType =
   | "auto_resolved"
   | "muted"
   | "pinned"
-  | "unpinned";
+  | "unpinned"
+  | "reopened";
 
 export interface IncidentEvent {
   id: number | null;
@@ -173,7 +186,7 @@ export interface Health {
   uptime_seconds: number;
   event_clock: string | null;
   event_lag_seconds: number | null;
-  events_processed: { app: number; audit: number };
+  events_processed: { app: number; audit: number; auth?: number };
   alerts_emitted: number;
   ws_clients: number;
   throughput: ThroughputSample | { app_eps: number; audit_eps: number };
@@ -218,6 +231,8 @@ export interface IncidentSearchResult {
 }
 
 export interface IncidentSearchParams {
+  service?: string;
+  source?: "app" | "audit" | "auth";
   status?: string;
   severity?: string;
   pinned?: boolean;
@@ -340,6 +355,8 @@ export interface DetectionRule {
   window_seconds?: number;
   step_seconds?: number;
   rolling_window_minutes?: number;
+  failure_threshold?: number;
+  window_minutes?: number;
   severity?: SeverityConfig;
   hipaa?: HipaaConfig;
 }
@@ -507,4 +524,251 @@ export interface DemoScenario {
   family: "service" | "hipaa" | "recovery";
   effect: string;
   expected: string;
+}
+
+// -- Incident Time Machine ----------------------------------------------------------------
+
+export type TimelineSource = "metrics" | "alerts" | "lifecycle" | "evidence";
+export type TimelinePhase = "before" | "during" | "after";
+
+export interface TimelineEntry {
+  id: string;
+  ts: string;
+  source: TimelineSource;
+  event_type: string;
+  service: string | null;
+  component: string | null;
+  severity: Severity | null;
+  level?: string | null;
+  summary: string;
+  phase: TimelinePhase;
+  observed?: Record<string, number | string | null> | null;
+  baseline?: Record<string, number | string | null> | null;
+  z?: number | null;
+  breaches_threshold?: boolean | null;
+  related?: boolean;
+}
+
+export type CoverageStatus = "complete" | "partial" | "none" | "expired" | "not_applicable";
+
+export interface TimelineCoverage {
+  window: { from: string; to: string };
+  metrics: {
+    applicable: boolean;
+    status: CoverageStatus;
+    points: number;
+    first: string | null;
+    last: string | null;
+    expected_interval_seconds: number;
+    gaps: { from: string; to: string; seconds: number }[];
+    message: string;
+  };
+  evidence: { stored: number; cap: number; status: "none" | "available" | "capped"; message: string };
+  raw_logs: string;
+  retention: { metrics_hours: number; metrics_horizon: string | null };
+}
+
+export interface DetectionExplanation {
+  rule: Record<string, unknown>;
+  rule_text: string;
+  kind: AnomalyKind;
+  alert_id: number | null;
+  alert_ts: string | null;
+  reason: string | null;
+  severity: Severity | null;
+  observed: Record<string, unknown> | null;
+  baseline: Record<string, unknown> | null;
+  threshold: Record<string, unknown> | null;
+  deviation: Record<string, unknown> | number | string | null;
+  available: boolean;
+  note?: string;
+}
+
+export interface TimelineResponse {
+  incident_id: number;
+  anchor: { opened_at: string; end: string; resolved: boolean };
+  query: { before_minutes: number; after_minutes: number; sources: TimelineSource[]; as_of: string | null };
+  entries: TimelineEntry[];
+  count: number;
+  coverage: TimelineCoverage;
+  downsampling: { applied: boolean; stride: number; metric_points_in_window: number };
+  explanation: DetectionExplanation;
+  state_as_of?: { as_of: string; status: string; severity: Severity | null; occurrences: number; events_applied: number; last_alert_ts: string | null };
+  notes: string[];
+  read_only: true;
+}
+
+export interface TimelineEntryDetail {
+  kind: string;
+  raw: Record<string, unknown>;
+  note: string;
+}
+
+// -- Simulator ----------------------------------------------------------------------------
+
+export interface SimScenario {
+  id: string;
+  title: string;
+  description: string;
+  seed: number;
+  expected_alerts: string;
+  expected_severity: Severity[];
+  expected_kind: AnomalyKind | null;
+  expected_entity: string | null;
+  max_detection_delay_s: number | null;
+  min_evidence: number;
+  must_resolve: boolean;
+  known_limit: boolean;
+  inject_seconds: number;
+  synthetic: true;
+}
+
+export interface SimCheck {
+  name: string;
+  passed: boolean;
+  expected: string | number;
+  observed: string | number;
+}
+
+export interface SimIncidentRow {
+  incident_id: number;
+  kind: AnomalyKind;
+  entity: string;
+  peak_severity: Severity;
+  state: IncidentState;
+  first_alert_at: string;
+  alert_count: number;
+  evidence_count: number;
+  evidence_quality: EvidenceQuality;
+  resolved_at: string | null;
+  label: "expected" | "related" | "false_positive";
+}
+
+export interface SimResult {
+  id?: number;
+  scenario_id: string;
+  title: string;
+  description: string;
+  seed: number;
+  synthetic: true;
+  known_limit: boolean;
+  passed: boolean;
+  summary: string;
+  checks: SimCheck[];
+  expected_alerts: string;
+  metrics: {
+    detection_delay_s: number | null;
+    false_positive_incidents: number;
+    false_positives_per_hour: number;
+    simulated_hours: number;
+    notification_decisions: number;
+    staff_notifications: number;
+    time_to_resolve_s: number | null;
+    events_processed: Record<string, number>;
+    alerts: number;
+    incidents: number;
+  };
+  incidents: SimIncidentRow[];
+  isolation: { database: string; aws_mode: string; email: string; external_calls: number };
+}
+
+export interface SimRunRow {
+  id: number;
+  created_at: string;
+  scenario_id: string;
+  seed: number;
+  passed: boolean;
+  summary: string;
+  requested_by: string;
+}
+
+export interface BenchmarkSummary {
+  runs: number;
+  passed: number;
+  injected_runs: number;
+  detected: number;
+  detection_rate: number | null;
+  detection_delay_s: { median: number | null; max: number | null };
+  known_limit_runs: number;
+  known_limit_detected: number;
+  control_runs: number;
+  control_false_positives: number;
+  control_false_positives_per_hour: number | null;
+  all_false_positives: number;
+  all_false_positives_per_hour: number | null;
+}
+
+export interface BenchmarkResult {
+  id?: number;
+  seeds: number[];
+  summary: BenchmarkSummary;
+  runs: { scenario_id: string; seed: number; passed: boolean; detection_delay_s: number | null; known_limit: boolean; false_positive_incidents: number; failed_checks: string[] }[];
+}
+
+// -- Security / roles -----------------------------------------------------------------------
+
+export interface MeResponse {
+  role: "viewer" | "operator" | "admin";
+  actor: string;
+  authenticated: boolean;
+  open_access: boolean;
+  can: { operate: boolean; admin: boolean };
+}
+
+export interface SecurityWarning {
+  code: string;
+  level: "critical" | "warning" | "info";
+  message: string;
+}
+
+export interface SecurityStatus {
+  warnings: SecurityWarning[];
+  auth: Record<string, boolean>;
+  roles: Record<string, string[]>;
+  redaction: { enabled: boolean };
+  retention: { policy: { data: string; keep: string; enabled: boolean; rule: string }[]; last_run: unknown; interval_hours: number };
+  processing: { data_source: string; database: string; cloud_integrations: { aws_mode: string; email_enabled: boolean } };
+  not_verified: string[];
+}
+
+// -- Correlation ------------------------------------------------------------------------------
+
+export interface CorrelatedEvent {
+  id: string;
+  source: string;
+  ts: string;
+  received_at: string | null;
+  actor: string | null;
+  resource: string | null;
+  service: string | null;
+  host: string | null;
+  request_id: string | null;
+  action: string | null;
+  outcome: string | null;
+  message: string;
+  late: boolean;
+}
+
+export interface CorrelationGroup {
+  group_id: string;
+  size: number;
+  sources: string[];
+  first_ts: string;
+  last_ts: string;
+  events: CorrelatedEvent[];
+  why: string[];
+  has_late_events: boolean;
+}
+
+export interface CorrelationResult {
+  groups: CorrelationGroup[];
+  event_count: number;
+  linked_event_count: number;
+  unlinked_event_count: number;
+  late_event_ids: string[];
+  skipped_for_missing_fields: { event_id: string; source: string; missing_by_rule: Record<string, string[]> }[];
+  adapter_skipped: { index: number; source: string; reason: string }[];
+  note: string;
+  limits?: string;
+  synthetic?: boolean;
 }

@@ -279,3 +279,25 @@ def test_concurrent_api_actions_leave_a_consistent_state_and_audit_trail(tmp_pat
         assert incident.state == "RESOLVED" and incident.pinned
         audit = c.get("/api/audit").json()
         assert sum(1 for r in audit if r["action"] == "resolve" and r["outcome"] == "ok") == 1
+
+
+def test_incident_search_filters_by_log_source_and_service(tmp_path):
+    from fastapi.testclient import TestClient
+    from tests.test_workflow import _build, _seed
+
+    app, pipeline = _build(tmp_path)
+    _seed(pipeline, kind="error_rate", service="claims")
+    _seed(pipeline, kind="error_rate", service="eligibility")
+    _seed(pipeline, kind="hipaa_bulk_access", user_id="U-1", score=0.0)
+    _seed(pipeline, kind="auth_suspicious_login", user_id="U-2", score=0.0)
+    with TestClient(app) as c:
+        def kinds(**params):
+            return sorted(i["kind"] for i in c.get("/api/incidents/search", params=params).json()["items"])
+
+        assert kinds(source="app") == ["error_rate", "error_rate"]
+        assert kinds(source="audit") == ["hipaa_bulk_access"]
+        assert kinds(source="auth") == ["auth_suspicious_login"]
+        assert kinds(service="claims") == ["error_rate"]
+        assert kinds(source="app", service="claims") == ["error_rate"]
+        assert kinds(source="auth", service="claims") == []
+        assert c.get("/api/incidents/search", params={"source": "mainframe"}).status_code == 422
