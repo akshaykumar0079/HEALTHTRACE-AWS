@@ -68,7 +68,7 @@ class EmbeddedGenerator:
         if self._task is not None:
             return
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("app.log", "audit.log"):
+        for name in ("app.log", "audit.log", "auth.log"):
             (self.log_dir / name).touch(exist_ok=True)
         self._stopping = False
         self._task = asyncio.create_task(self._supervise(), name="embedded-generator")

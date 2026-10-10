@@ -32,8 +32,10 @@ from generator.scenarios import (
     ALL_SCENARIO_NAMES,
     RECOVERY_SCENARIO,
     AccessScenario,
+    AuthScenario,
     ServiceScenario,
     get_access_scenario,
+    get_auth_scenario,
     get_service_scenario,
 )
 
@@ -263,6 +265,32 @@ def make_audit_event(
     }
 
 
+def make_auth_event(
+    user: UserProfile,
+    ts: datetime,
+    rng: random.Random,
+    *,
+    outcome: str = "success",
+    source_region: Optional[str] = None,
+) -> dict:
+    """Build one auth.log line: a login attempt. ``source_ip`` is drawn from the
+    documentation range 192.0.2.0/24 (RFC 5737), so it never points at a real host."""
+    return {
+        "ts": _iso(ts),
+        "type": "auth",
+        "user_id": user.user_id,
+        "outcome": outcome,
+        "method": "password",
+        "source_region": source_region or user.region,
+        "user_region": user.region,
+        "source_ip": f"192.0.2.{rng.randint(1, 254)}",
+    }
+
+
+# Ordinary staff mistype a password now and then; never five times in a row.
+_NORMAL_LOGIN_FAILURE_RATE = 0.03
+
+
 def _poisson_times(start: datetime, duration_s: float, rate_per_sec: float, rng: random.Random) -> Iterator[datetime]:
     """Event arrival times for a Poisson process, so ~rate_per_sec events land per second on average."""
     rate_per_sec = max(rate_per_sec, 1e-6)
@@ -285,8 +313,22 @@ def generate_batch(
     named scenario (SPEC.md section 7) injected on top. Returns (app_events,
     audit_events), each sorted by ts. scenario_name=None or "recovery" means
     plain normal traffic (used for --backfill-hours and for demonstrating
-    recovery).
+    recovery). Use ``generate_events`` to also get the auth log.
     """
+    app_events, audit_events, _ = generate_events(scenario_name, duration_s, rate, start, rng)
+    return app_events, audit_events
+
+
+def generate_events(
+    scenario_name: Optional[str],
+    duration_s: float,
+    rate: float,
+    start: datetime,
+    rng: random.Random,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Like ``generate_batch`` but also returns the auth events. The auth
+    events are drawn from the RNG *after* everything else, so app and audit
+    output for a given seed is identical to ``generate_batch``."""
     if scenario_name not in (None, *ALL_SCENARIO_NAMES):
         raise ValueError(f"Unknown scenario: {scenario_name}")
 
@@ -321,7 +363,36 @@ def generate_batch(
 
     app_events.sort(key=lambda e: e["ts"])
     audit_events.sort(key=lambda e: e["ts"])
-    return app_events, audit_events
+
+    auth_rate = max(audit_rate / 10, 0.05)
+    auth_events = [
+        make_auth_event(
+            rng.choice(users), ts, rng,
+            outcome="failure" if rng.random() < _NORMAL_LOGIN_FAILURE_RATE else "success",
+        )
+        for ts in _poisson_times(start, duration_s, auth_rate, rng)
+        if hours.contains(ts)
+    ]
+    auth_scn = get_auth_scenario(scenario_name) if scenario_name else None
+    if auth_scn is not None:
+        auth_events += _auth_burst(auth_scn, start, duration_s, rng)
+    auth_events.sort(key=lambda e: e["ts"])
+    return app_events, audit_events, auth_events
+
+
+def _auth_burst(scn: AuthScenario, start: datetime, duration_s: float, rng: random.Random) -> list[dict]:
+    """The scenario's failures, evenly spread over the first 60% of the run,
+    then one successful login from the same unfamiliar region."""
+    user = _scenario_user_profile(scn.user_id, "TN-North")
+    span = max(duration_s * 0.6, 1.0)
+    step = span / scn.failures
+    events = [
+        make_auth_event(user, start + timedelta(seconds=i * step), rng, outcome="failure", source_region=scn.source_region)
+        for i in range(scn.failures)
+    ]
+    events.append(make_auth_event(user, start + timedelta(seconds=span + step), rng, outcome="success",
+                                  source_region=scn.source_region))
+    return events
 
 
 def _append_lines(path: Path, events: list[dict]) -> None:
@@ -349,6 +420,7 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
     hours = load_business_hours()
     app_path = log_dir / "app.log"
     audit_path = log_dir / "audit.log"
+    auth_path = log_dir / "auth.log"
 
     active_service: Optional[ServiceScenario] = None
     active_access: Optional[AccessScenario] = None
@@ -362,10 +434,15 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
     last_control_mtime: Optional[float] = existing[1] if existing else None
 
     audit_rate = max(rate / 6, 0.5)
+    auth_rate = max(audit_rate / 10, 0.05)
+    # Scenario login events waiting for their moment: (due monotonic time, builder).
+    pending_auth: list[tuple[float, str, Optional[str], str]] = []
 
-    with app_path.open("a", encoding="utf-8") as app_f, audit_path.open("a", encoding="utf-8") as audit_f:
+    with app_path.open("a", encoding="utf-8") as app_f, audit_path.open("a", encoding="utf-8") as audit_f, \
+            auth_path.open("a", encoding="utf-8") as auth_f:
         next_app = time.monotonic()
         next_audit = time.monotonic()
+        next_auth = time.monotonic()
         next_target = time.monotonic()
         scenario_pace = 0.0
 
@@ -387,6 +464,13 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
                         else:
                             active_service = get_service_scenario(name)
                             active_access = get_access_scenario(name)
+                            auth_scn = get_auth_scenario(name)
+                            if auth_scn is not None:
+                                span = max(duration_s * 0.6, 1.0)
+                                step = span / auth_scn.failures
+                                for i in range(auth_scn.failures):
+                                    pending_auth.append((now_mono + i * step, auth_scn.user_id, auth_scn.source_region, "failure"))
+                                pending_auth.append((now_mono + span + step, auth_scn.user_id, auth_scn.source_region, "success"))
                             active_until = now_mono + duration_s
                             scenario_started_at = datetime.now(timezone.utc)
                             if active_access is not None:
@@ -424,6 +508,25 @@ def run_live(rate: float, log_dir: Path, control_file: Path, rng: random.Random)
 
             if active_access is not None and now_mono - next_target > 5.0:
                 next_target = now_mono
+            if now_mono - next_auth > 5.0:
+                next_auth = now_mono
+            while now_mono >= next_auth:
+                ts = datetime.now(timezone.utc)
+                if hours.contains(ts):
+                    failed = rng.random() < _NORMAL_LOGIN_FAILURE_RATE
+                    auth_f.write(json.dumps(make_auth_event(
+                        rng.choice(users), ts, rng, outcome="failure" if failed else "success")) + "\n")
+                    auth_f.flush()
+                next_auth += rng.expovariate(auth_rate)
+
+            for due in [p for p in pending_auth if now_mono >= p[0]]:
+                pending_auth.remove(due)
+                _, user_id, region, outcome = due
+                auth_f.write(json.dumps(make_auth_event(
+                    _scenario_user_profile(user_id, "TN-North"), datetime.now(timezone.utc), rng,
+                    outcome=outcome, source_region=region)) + "\n")
+                auth_f.flush()
+
             while active_access is not None and now_mono >= next_target:
                 ts = datetime.now(timezone.utc)
                 if active_access.kind == "off_hours" and active_access.hour_of_day is not None:
@@ -457,24 +560,26 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.backfill_hours is not None:
         end = datetime.now(timezone.utc)
         start = end - timedelta(hours=args.backfill_hours)
-        app_events, audit_events = generate_batch(None, args.backfill_hours * 3600, args.rate, start, rng)
+        app_events, audit_events, auth_events = generate_events(None, args.backfill_hours * 3600, args.rate, start, rng)
         _append_lines(args.log_dir / "app.log", app_events)
         _append_lines(args.log_dir / "audit.log", audit_events)
+        _append_lines(args.log_dir / "auth.log", auth_events)
         print(
-            f"Backfilled {len(app_events)} app events and {len(audit_events)} audit events "
+            f"Backfilled {len(app_events)} app, {len(audit_events)} audit and {len(auth_events)} auth events "
             f"over {args.backfill_hours}h -> {args.log_dir}"
         )
         return
 
     if args.scenario is not None:
-        app_events, audit_events = generate_batch(
+        app_events, audit_events, auth_events = generate_events(
             args.scenario, args.duration, args.rate, datetime.now(timezone.utc), rng
         )
         _append_lines(args.log_dir / "app.log", app_events)
         _append_lines(args.log_dir / "audit.log", audit_events)
+        _append_lines(args.log_dir / "auth.log", auth_events)
         print(
             f"Injected '{args.scenario}' for {args.duration}s: "
-            f"{len(app_events)} app events, {len(audit_events)} audit events -> {args.log_dir}"
+            f"{len(app_events)} app, {len(audit_events)} audit, {len(auth_events)} auth events -> {args.log_dir}"
         )
         return
 

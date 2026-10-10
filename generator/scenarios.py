@@ -40,6 +40,17 @@ class AccessScenario:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class AuthScenario:
+    """Repeated failed logins for one user followed by a successful login."""
+
+    name: str
+    user_id: str
+    failures: int
+    source_region: str  # where the failed and the successful logins come from
+    description: str = ""
+
+
 SERVICE_SCENARIOS: dict[str, ServiceScenario] = {
     "urgent_prior_auth_failure": ServiceScenario(
         name="urgent_prior_auth_failure",
@@ -109,9 +120,20 @@ ACCESS_SCENARIOS: dict[str, AccessScenario] = {
     ),
 }
 
+AUTH_SCENARIOS: dict[str, AuthScenario] = {
+    "suspicious_login": AuthScenario(
+        name="suspicious_login",
+        user_id="U-064",
+        failures=8,
+        source_region="EXT-VPN",
+        description="U-064 fails to log in 8 times, then succeeds from an unfamiliar region",
+    ),
+}
+
 ALL_SCENARIO_NAMES: list[str] = [
     *SERVICE_SCENARIOS.keys(),
     *ACCESS_SCENARIOS.keys(),
+    *AUTH_SCENARIOS.keys(),
     RECOVERY_SCENARIO,
 ]
 
@@ -122,3 +144,7 @@ def get_service_scenario(name: str) -> Optional[ServiceScenario]:
 
 def get_access_scenario(name: str) -> Optional[AccessScenario]:
     return ACCESS_SCENARIOS.get(name)
+
+
+def get_auth_scenario(name: str) -> Optional[AuthScenario]:
+    return AUTH_SCENARIOS.get(name)

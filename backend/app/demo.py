@@ -37,6 +37,9 @@ SCENARIOS: list[Scenario] = [
      "family": "hipaa", "effect": "U-042 accesses records at a simulated 03:00", "expected": "MEDIUM or HIGH"},
     {"name": "region_mismatch", "label": "Region mismatch", "target": "U-088",
      "family": "hipaa", "effect": "U-088 views 12 patients from another region", "expected": "HIGH"},
+    {"name": "suspicious_login", "label": "Suspicious login", "target": "U-064",
+     "family": "auth", "effect": "U-064 fails 8 logins, then succeeds from an unfamiliar region",
+     "expected": "HIGH"},
     {"name": "recovery", "label": "Recovery", "target": None,
      "family": "recovery", "effect": "return to normal traffic", "expected": "incidents auto-resolve"},
 ]
