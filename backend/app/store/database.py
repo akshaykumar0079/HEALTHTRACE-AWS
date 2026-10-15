@@ -24,6 +24,8 @@ from typing import Any, Optional, Sequence
 
 import aiosqlite
 
+from app.privacy.safe_log import quiet_driver_logs
+
 log = logging.getLogger("healthtrace.db")
 
 Params = Sequence[Any]
@@ -113,6 +115,7 @@ class SqliteDatabase(Database):
         self._conn: Optional[aiosqlite.Connection] = None
 
     async def connect(self) -> None:
+        quiet_driver_logs()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
         # WAL + NORMAL: commits no longer fsync, which is what capped the
@@ -192,6 +195,7 @@ class PostgresDatabase(Database):
         return "BIGINT"
 
     async def connect(self) -> None:
+        quiet_driver_logs()
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - depends on install

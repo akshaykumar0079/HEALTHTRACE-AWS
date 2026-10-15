@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
 from app.models import Alert, Incident
+from app.privacy.safe_log import safe_exc, sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -228,8 +229,8 @@ class AwsNotifier:
             item = await self._queue.get()
             try:
                 await self._process_with_retry(item)
-            except Exception:
-                logger.exception("notifier: unexpected error processing %r", item)
+            except Exception as exc:  # the item (an alert payload) is deliberately not logged
+                logger.error("notifier: unexpected error processing a %s item: %s", item[0], safe_exc(exc))
             finally:
                 self._queue.task_done()
 
@@ -250,8 +251,8 @@ class AwsNotifier:
                 return
             except Exception as exc:
                 if attempt == self.max_attempts:
-                    logger.error("notifier: giving up after %d attempts (%s): %s", attempt, channel, exc)
-                    status.record("failed", subject, f"{type(exc).__name__}: {exc}")
+                    logger.error("notifier: giving up after %d attempts (%s): %s", attempt, channel, sanitize_error(exc))
+                    status.record("failed", subject, sanitize_error(exc))
                     return
                 status.retries += 1
                 await asyncio.sleep(self.base_backoff * (2 ** (attempt - 1)))

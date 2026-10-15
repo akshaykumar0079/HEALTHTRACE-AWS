@@ -463,6 +463,74 @@ class Store:
             "ORDER BY ts DESC, id DESC LIMIT ?", (incident_id, limit))).fetchall()
         return [{"id": r[0], "alert_id": r[1], "ts": r[2], "record": json.loads(r[3])} for r in rows]
 
+    # -- ingestion bookkeeping (m004): metadata only, never raw lines -------------------
+
+    async def save_ingest_rejects(self, counts: dict, last_at: dict, rows: list[dict[str, Any]],
+                                  *, keep_rows: int = 2000) -> None:
+        for (source, reason), n in counts.items():
+            await self.conn.execute(
+                """
+                INSERT INTO ingest_reject_counts (source, reason, count, last_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(source, reason) DO UPDATE SET count = ingest_reject_counts.count + excluded.count,
+                                                          last_at = excluded.last_at
+                """,
+                (source, reason, int(n), last_at.get((source, reason), datetime.now(timezone.utc).isoformat())),
+            )
+        if rows:
+            await self.conn.executemany(
+                "INSERT INTO ingest_rejects (ts, source, reason, line_offset, line_length) VALUES (?, ?, ?, ?, ?)",
+                [(r["ts"], r["source"], r["reason"], r.get("offset"), r.get("length")) for r in rows],
+            )
+            await self.conn.execute(
+                "DELETE FROM ingest_rejects WHERE id <= "
+                "(SELECT id FROM ingest_rejects ORDER BY id DESC LIMIT 1 OFFSET ?)", (keep_rows,))
+        await self.conn.commit()
+
+    async def load_ingest_reject_counts(self) -> list[tuple[str, str, int]]:
+        rows = await (await self.conn.execute("SELECT source, reason, count FROM ingest_reject_counts")).fetchall()
+        return [(r[0], r[1], int(r[2])) for r in rows]
+
+    async def list_ingest_rejects(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = await (await self.conn.execute(
+            "SELECT ts, source, reason, line_offset, line_length FROM ingest_rejects ORDER BY id DESC LIMIT ?",
+            (limit,))).fetchall()
+        return [{"ts": r[0], "source": r[1], "reason": r[2], "offset": r[3], "length": r[4]} for r in rows]
+
+    async def save_ingest_seen(self, pairs: list[tuple[str, str]], *, keep_per_source: int = 50_000) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        await self.conn.executemany(
+            "INSERT INTO ingest_seen (source, event_id, seen_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(source, event_id) DO NOTHING",
+            [(s, k, now) for s, k in pairs],
+        )
+        for source in {s for s, _ in pairs}:
+            await self.conn.execute(
+                "DELETE FROM ingest_seen WHERE source = ? AND id <= "
+                "(SELECT id FROM ingest_seen WHERE source = ? ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                (source, source, keep_per_source))
+        await self.conn.commit()
+
+    async def load_ingest_seen(self, *, limit_per_source: int = 50_000) -> dict[str, list[str]]:
+        sources = await (await self.conn.execute("SELECT DISTINCT source FROM ingest_seen")).fetchall()
+        out: dict[str, list[str]] = {}
+        for (source,) in sources:
+            rows = await (await self.conn.execute(
+                "SELECT event_id FROM ingest_seen WHERE source = ? ORDER BY id DESC LIMIT ?",
+                (source, limit_per_source))).fetchall()
+            out[source] = [r[0] for r in reversed(rows)]  # oldest first
+        return out
+
+    async def get_ingest_meta(self, key: str) -> Optional[str]:
+        row = await (await self.conn.execute("SELECT value FROM ingest_meta WHERE key = ?", (key,))).fetchone()
+        return None if row is None else row[0]
+
+    async def set_ingest_meta(self, key: str, value: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO ingest_meta (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, value, datetime.now(timezone.utc).isoformat()))
+        await self.conn.commit()
+
     # -- audit log -------------------------------------------------------------------
 
     async def add_audit(

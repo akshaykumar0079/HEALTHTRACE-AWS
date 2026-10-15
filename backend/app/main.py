@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +20,9 @@ from app.api.routes import router as api_router
 from app.api.ws import router as ws_router
 from app.config import AppConfig, Settings, get_settings, load_config
 from app.pipeline import Pipeline
+from app.privacy.safe_log import safe_exc
+
+logger = logging.getLogger(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -88,6 +92,24 @@ def create_app(settings: Optional[Settings] = None, config: Optional[AppConfig] 
             if len(hits) > 5000:
                 hits.clear()
         return await call_next(request)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default body echoes the offending input value back; keep only where and why.
+        detail = [{"loc": list(e.get("loc", ())), "msg": e.get("msg", "invalid"), "type": e.get("type", "invalid")}
+                  for e in exc.errors()]
+        return JSONResponse({"detail": detail}, status_code=422)
+
+    @app.middleware("http")
+    async def error_boundary(request: Request, call_next):
+        """An unhandled error becomes a generic 500. The exception text, which may
+        embed the value that caused it, is neither returned nor logged: only the
+        exception type and code location are."""
+        try:
+            return await call_next(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("unhandled error on %s %s: %s", request.method, request.url.path, safe_exc(exc))
+            return JSONResponse({"detail": "Internal server error"}, status_code=500)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):

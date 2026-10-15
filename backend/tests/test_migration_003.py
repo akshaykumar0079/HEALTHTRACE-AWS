@@ -52,7 +52,7 @@ async def test_upgrade_from_version_2_keeps_data_and_backfills(kind, tmp_path, m
     old_cols = await db.column_names("incidents")
     assert "risk_trend" not in old_cols and not await db.table_exists("simulation_runs")
 
-    assert await migrate(db) == [3]
+    assert await migrate(db) == list(range(3, LATEST_VERSION + 1))
     cols = await db.column_names("incidents")
     assert {"latest_score", "risk_trend", "reopen_count", "evidence_count"} <= cols
     assert await db.table_exists("simulation_runs")

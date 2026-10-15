@@ -136,3 +136,15 @@ auth:
 window:
   size_seconds: 60
   step_seconds: 5
+
+# Configured ingestion (INGEST_MODE=configured). Example only, commented out.
+# See docs/ingestion.md. Names are illustrative; no real product format is implied.
+# ingest:
+#   max_future_skew_seconds: 300
+#   sources:
+#     - id: idp_export
+#       path: idp.jsonl
+#       kind: auth
+#       timezone: Asia/Kolkata
+#       fields: {ts: "@timestamp", event_id: event.id, user_id: actor.name, outcome: event.outcome, source_region: client.geo, user_region: actor.home_geo, source_ip: client.ip}
+#       values: {outcome: {Success: success, Failure: failure}}

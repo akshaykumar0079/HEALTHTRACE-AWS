@@ -536,7 +536,7 @@ async def config(request: Request) -> dict[str, Any]:
             "demo_mode": s.demo_mode,
             "aws_mode": s.aws_mode,
             "log_sources": [
-                {"name": t.path.name, "path": str(t.path), "size_bytes": t.file_size, "offset": t.committed_offset}
+                {"name": t.path.name, "path": t.path.name, "size_bytes": t.file_size, "offset": t.committed_offset}
                 for t in pipeline._tailers  # noqa: SLF001
             ],
             "operator_token_required": bool(s.operator_token),
@@ -775,9 +775,47 @@ def _security_warnings(pipeline: Pipeline) -> list[dict[str, str]]:
         warn("cors_wildcard", "warning", "CORS allows every origin.")
     if s.environment.lower() in ("production", "prod") and pipeline.store.dialect == "sqlite":
         warn("sqlite_in_production", "warning", "Production is using local SQLite instead of PostgreSQL.")
+    if s.ingest_mode == "legacy":
+        warn("legacy_ingest", "warning",
+             "INGEST_MODE=legacy reads synthetic files with raw identifiers and no event-id de-duplication. "
+             "It is for demos and tests and is NOT suitable for real logs. Use INGEST_MODE=configured.")
+    elif pipeline.registry is not None and any(
+            src.cfg.include_msg for src in pipeline.registry.sources.values()
+        ):
+        warn("free_text_ingest", "warning",
+             "A source opts in to free-text messages (include_msg). Text is only pattern-redacted and the event's "
+             "own identifiers are removed; other identifiers in free text pass through. Prefer omitting it.")
+    if s.ingest_mode != "legacy" and pipeline.key_state.get("legacy_rows_at_cutover"):
+        warn("historical_raw_data", "warning",
+             "This database already held incidents or alerts when pseudonymization was enabled. Those rows were "
+             "written before the privacy boundary and may contain raw identifiers. They are not rewritten; follow the "
+             "cutover procedure in docs/privacy-boundary.md (new database, retention, or an offline copy).")
+    if pipeline.key_state.get("rotated_at"):
+        warn("pseudonym_key_rotated", "info",
+             "The pseudonymization key was rotated on this database: incidents before and after the rotation use "
+             "different pseudonyms for the same person and do not correlate.")
+    if s.ingest_mode != "legacy" and s.ingest_dedupe == "content":
+        warn("content_dedupe", "info",
+             "Content-hash de-duplication is on: genuinely distinct events that serialize identically are collapsed.")
     if s.data_source == "simulated":
         warn("simulated_data", "info", "Data is synthetic. No real patient data should be connected without a security review.")
     return out
+
+
+@router.get("/ingest/status")
+async def ingest_status(request: Request) -> dict[str, Any]:
+    """Per-source state, counters and reject reasons. Metadata only: no line
+    content, no raw identifiers, no file system paths beyond the file name."""
+    pipeline = _pipeline(request)
+    return {
+        "mode": pipeline.settings.ingest_mode,
+        "dedupe": pipeline.deduper.stats(),
+        "pseudonymization": {"enabled": pipeline.pseudonymizer is not None, **pipeline.key_state},
+        "sources": [t.status() | {"source": t.source} for t in pipeline._tailers],  # noqa: SLF001
+        "rejects": pipeline.quarantine.summary(),
+        "naive_timestamps_assumed_utc": pipeline.parser.naive_assumed_utc,
+        "tailer_restarts": pipeline.tailer_restarts,
+    }
 
 
 @router.get("/security/status")

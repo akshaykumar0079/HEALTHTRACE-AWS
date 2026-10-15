@@ -45,6 +45,7 @@ from zoneinfo import ZoneInfo
 from pydantic import SecretStr
 
 from app.models import Alert, Incident
+from app.privacy.safe_log import mask_email, mask_emails_in, safe_exc
 from app.notify.aws import ChannelStatus
 
 logger = logging.getLogger(__name__)
@@ -292,7 +293,7 @@ class EmailNotifier:
             if self.settings.enabled and self.configured:
                 via = "Brevo API" if self.settings.provider == "brevo" else f"{self.settings.host}:{self.settings.port}"
                 logger.info("email notifier: enabled, HIGH/CRITICAL incidents -> %s via %s",
-                            ", ".join(self.settings.recipients), via)
+                            ", ".join(mask_email(r) for r in self.settings.recipients), via)
             self._worker_task = asyncio.create_task(self._run())
 
     async def stop(self, drain_timeout: float = STOP_DRAIN_TIMEOUT_SECONDS) -> None:
@@ -356,8 +357,8 @@ class EmailNotifier:
             result = hook(info)
             if asyncio.iscoroutine(result):
                 asyncio.ensure_future(result)
-        except Exception:  # persistence must never break sending
-            logger.exception("email notifier: attempt hook failed")
+        except Exception as exc:  # persistence must never break sending
+            logger.error("email notifier: attempt hook failed: %s", safe_exc(exc))
 
     # -- runtime preferences (Settings -> Notifications) ---------------------------
 
@@ -381,8 +382,8 @@ class EmailNotifier:
                     self.build_message(incident, alert, escalated=escalated),
                     context={"kind": "incident", "incident_id": incident.id, "severity": incident.peak_severity},
                 )
-            except Exception:
-                logger.exception("email notifier: unexpected error for incident #%s", incident.id)
+            except Exception as exc:
+                logger.error("email notifier: unexpected error for incident #%s: %s", incident.id, safe_exc(exc))
             finally:
                 self._queue.task_done()
 
@@ -397,7 +398,7 @@ class EmailNotifier:
                 self.status.record("sent", subject)
                 self._emit({**context, "status": "accepted", "provider_message_id": message_id,
                             "detail": f"accepted by {self.settings.provider} (not a delivery confirmation)"})
-                logger.info("email notifier: sent %r to %s", subject, message["To"])
+                logger.info("email notifier: sent %r to %s", subject, mask_emails_in(message["To"]))
                 return True
             except Exception as exc:
                 error = self._describe_error(exc)
@@ -510,7 +511,7 @@ class EmailNotifier:
         for secret in (self.settings.password.get_secret_value(), self.settings.api_key.get_secret_value()):
             if secret:
                 text = text.replace(secret, "***")
-        return " ".join(text.split())
+        return mask_emails_in(" ".join(text.split()))
 
     # -- message -----------------------------------------------------------------
 

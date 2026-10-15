@@ -13,8 +13,10 @@ Priority = Literal["urgent", "routine"]
 AuditAction = Literal["VIEW_RECORD", "EDIT_RECORD", "EXPORT_RECORDS", "SEARCH"]
 AuthOutcome = Literal["success", "failure"]
 
-# Synthetic patient IDs only, e.g. "P-000123" (SPEC.md section 1: hard rules).
-PATIENT_ID_PATTERN = r"^P-\d{6}$"
+# Synthetic patient IDs ("P-000123", SPEC.md section 1: hard rules) or, for
+# configured ingestion, the keyed pseudonym "P-" + 12 hex characters
+# (app/ingest/pseudonym.py). A raw hospital identifier never matches either form.
+PATIENT_ID_PATTERN = r"^P-(\d{6}|[0-9a-f]{12})$"
 
 
 class AppEvent(BaseModel):

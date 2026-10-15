@@ -48,3 +48,5 @@ simulate) are written to the audit log (`GET /api/audit`).
 Versioned, additive, idempotent, run at start-up on SQLite and PostgreSQL. m003
 adds timeline/evidence/simulation tables and incident grouping columns without
 dropping or rewriting existing data. Back up the database before upgrading.
+
+See also: [Privacy boundary](privacy-boundary.md) (field inventory, historical data, key rotation) and [M2 verification](M2_PRIVACY_VERIFICATION.md).

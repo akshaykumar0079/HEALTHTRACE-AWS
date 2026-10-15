@@ -13,10 +13,10 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, SecretStr
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/app/config.py -> backend/app -> backend -> repo root
@@ -97,6 +97,76 @@ class AuthConfig(BaseModel):
     realert_seconds: float = 60
 
 
+CANONICAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "auth": ("ts", "event_id", "user_id", "outcome", "method", "source_region", "user_region", "source_ip"),
+    "audit": ("ts", "event_id", "user_id", "role", "action", "patient_id", "patient_region", "user_region"),
+    "app": ("ts", "event_id", "service", "level", "priority", "request_id", "patient_id", "status",
+            "latency_ms", "msg"),
+}
+REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "auth": ("ts", "user_id", "outcome", "source_region", "user_region"),
+    "audit": ("ts", "user_id", "role", "action", "patient_id", "patient_region", "user_region"),
+    "app": ("ts", "service", "level", "priority", "request_id", "status", "latency_ms", "msg"),
+}
+
+
+class SourceConfig(BaseModel):
+    """One configured, read-only log source (docs/ingestion.md).
+
+    ``fields`` maps a canonical field to a (dotted) path in the source's JSON;
+    ``values`` maps source values to canonical ones per field (``outcome``,
+    ``action``, ``service``, ``level``...); ``defaults`` supplies a constant when a
+    field is absent. Anything not mapped is rejected with a reason code, never guessed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    path: str
+    format: Literal["json_lines", "generator_v1"] = "json_lines"
+    kind: Optional[Literal["app", "audit", "auth"]] = None
+    enabled: bool = True
+    timezone: Optional[str] = None            # applied only to timestamps with no offset
+    from_start: bool = False
+    stalled_after_seconds: Optional[float] = None
+    max_msg_chars: int = 500
+    include_msg: bool = False                 # explicit opt-in for free text; off = constant placeholder
+    fields: dict[str, str] = Field(default_factory=dict)
+    values: dict[str, dict[str, str]] = Field(default_factory=dict)
+    defaults: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_mapping(self) -> "SourceConfig":
+        if self.format == "generator_v1":
+            return self
+        if "msg" in self.fields and not self.include_msg:
+            raise ValueError(
+                f"source {self.id}: 'msg' is mapped but include_msg is false. Free text is omitted by default; "
+                "set include_msg: true to opt in (it is only pattern-redacted), or remove the mapping")
+        if self.include_msg and "msg" not in self.fields:
+            raise ValueError(f"source {self.id}: include_msg is true but 'msg' is not mapped")
+        if self.kind is None:
+            raise ValueError(f"source {self.id}: 'kind' (app|audit|auth) is required for json_lines")
+        allowed = set(CANONICAL_FIELDS[self.kind])
+        for label, names in (("fields", self.fields), ("values", self.values), ("defaults", self.defaults)):
+            unknown = sorted(set(names) - allowed)
+            if unknown:
+                raise ValueError(f"source {self.id}: unknown canonical field(s) in {label}: {unknown}")
+        optional = () if self.include_msg else ("msg",)  # omitted free text is replaced by a constant
+        missing = [f for f in REQUIRED_FIELDS[self.kind]
+                   if f not in self.fields and f not in self.defaults and f not in optional]
+        if missing:
+            raise ValueError(f"source {self.id}: no mapping or default for required field(s): {missing}")
+        for must in ("ts", "user_id") if self.kind != "app" else ("ts",):
+            if must not in self.fields:
+                raise ValueError(f"source {self.id}: '{must}' must be mapped from the log, not defaulted")
+        return self
+
+
+class IngestConfig(BaseModel):
+    max_future_skew_seconds: float = 300
+    sources: list[SourceConfig] = Field(default_factory=list)
+
+
 class WindowConfig(BaseModel):
     size_seconds: float
     step_seconds: float
@@ -112,6 +182,7 @@ class AppConfig(BaseModel):
     incident: IncidentConfig
     window: WindowConfig
     auth: AuthConfig = AuthConfig()
+    ingest: IngestConfig = IngestConfig()
 
 
 @lru_cache
@@ -205,6 +276,26 @@ class Settings(BaseSettings):
     admin_token: str = ""
     # Require a token even to read (viewer, operator or admin).
     require_view_auth: bool = False
+    # -- ingestion (docs/ingestion.md) ----------------------------------------------
+    # legacy: the three synthetic files, parsed by the project's own schemas
+    # (demo/test use only: NOT suitable for real logs). configured: sources from
+    # config.yaml `ingest.sources`, with pseudonymization (needs PSEUDONYM_KEY).
+    ingest_mode: str = "legacy"
+    # event_id (default) | content (opt-in, see docs) | off
+    ingest_dedupe: str = "event_id"
+    # Longest accepted log line in bytes; longer lines are discarded and counted.
+    ingest_max_line_bytes: int = 1 << 20
+    # Secret for keyed pseudonymization of user ids, patient ids and source IPs in
+    # configured mode. Required there (no fallback); never logged or stored.
+    # Generate: python -c "import secrets; print(secrets.token_hex(32))"
+    pseudonym_key: SecretStr = SecretStr("")
+    # Extra directories (comma-separated, absolute) that configured sources may
+    # read from. LOG_DIR is always allowed. Symlinks are resolved before the check.
+    ingest_allowed_dirs: str = ""
+    # Set to true for ONE start to accept a changed PSEUDONYM_KEY on an existing database.
+    # Every pseudonym changes with the key, so old and new incidents for the same person no
+    # longer correlate; without this flag a changed key stops start-up (docs/privacy-boundary.md).
+    pseudonym_key_rotation_ack: bool = False
     # Built frontend to serve at "/", if present.
     static_dir: Path = REPO_ROOT / "frontend" / "dist"
 

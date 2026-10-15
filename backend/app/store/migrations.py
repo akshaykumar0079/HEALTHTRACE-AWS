@@ -243,6 +243,58 @@ async def _m003_time_machine(db: Database) -> None:
     )
 
 
+async def _m004_ingest_hardening(db: Database) -> None:
+    """Ingestion bookkeeping, all metadata: reject counters, a bounded sample of
+    recent rejections (offset/length/reason, **never the line**), and the recent
+    event-id window used for duplicate suppression across restarts."""
+    pk, big = db.pk, db.bigint
+    await db.run_script(
+        f"""
+        CREATE TABLE IF NOT EXISTS ingest_reject_counts (
+            source TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            count {big} NOT NULL DEFAULT 0,
+            last_at TEXT NOT NULL,
+            PRIMARY KEY (source, reason)
+        );
+
+        CREATE TABLE IF NOT EXISTS ingest_rejects (
+            id {pk},
+            ts TEXT NOT NULL,
+            source TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            line_offset {big},
+            line_length {big}
+        );
+        CREATE INDEX IF NOT EXISTS idx_ingest_rejects_ts ON ingest_rejects(ts);
+
+        CREATE TABLE IF NOT EXISTS ingest_seen (
+            id {pk},
+            source TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            seen_at TEXT NOT NULL,
+            CONSTRAINT uq_ingest_seen UNIQUE (source, event_id)
+        )
+        """
+    )
+
+
+async def _m005_ingest_meta(db: Database) -> None:
+    """Small key/value bookkeeping for ingestion. Holds only non-secret facts, e.g. a
+    one-way fingerprint of the pseudonymization key (so a changed key is noticed
+    instead of silently re-labelling every actor) and whether rows already existed
+    when configured mode was first enabled. Never the key, never an identifier."""
+    await db.run_script(
+        """
+        CREATE TABLE IF NOT EXISTS ingest_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 @dataclass(frozen=True)
 class Migration:
     version: int
@@ -254,6 +306,8 @@ MIGRATIONS: list[Migration] = [
     Migration(1, "baseline_schema", _m001_baseline_schema),
     Migration(2, "incident_workflow", _m002_incident_workflow),
     Migration(3, "time_machine", _m003_time_machine),
+    Migration(4, "ingest_hardening", _m004_ingest_hardening),
+    Migration(5, "ingest_meta", _m005_ingest_meta),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1].version

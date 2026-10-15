@@ -142,16 +142,23 @@ async def test_interrupted_first_run_does_not_skip_history(tmp_path: Path):
 
     first = Pipeline(settings, load_config())
     await first.start()
-    for tailer in first._tailers:  # tasks haven't run yet: read ~10 lines per poll
-        tailer.max_chunk_bytes = len(history[0]) * 10
-    while first.events_processed["app"] < 12:  # enough windows to have learned baselines
-        await asyncio.sleep(0)
-    # A periodic save lands, then the process dies before a graceful stop.
+    # Nothing has awaited since start(), so the background tasks have not run yet. Stop them and
+    # read exactly two ~10-line chunks by hand: the interruption point is then deterministic
+    # instead of depending on how the event loop interleaves the tailer with database I/O
+    # (the original free-running version failed ~3-7% of runs, also on the unmodified baseline).
     for tailer in first._tailers:
+        tailer.max_chunk_bytes = len(history[0]) * 10
         tailer.stop()
     for task in first._tasks:
         task.cancel()
     await asyncio.gather(*first._tasks, return_exceptions=True)
+    for tailer in first._tailers:
+        for _ in range(2):
+            try:
+                await tailer.poll_once()
+            except FileNotFoundError:  # a log this test never creates (run() would also tolerate it)
+                break
+    # A periodic save lands (enough windows to have learned baselines), then the process dies.
     await first.queue.join()
     await first._save_state()
     seen_first = first.events_processed["app"]

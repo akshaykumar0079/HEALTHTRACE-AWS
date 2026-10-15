@@ -109,6 +109,28 @@ set `ENVIRONMENT=production`; keep redaction on; restrict `CORS_ORIGINS`; serve
 over HTTPS behind real sign-in; review retention; back up before migrating;
 never commit `.env`; confirm `/api/security/status` shows no warnings.
 
+## Configured ingestion (toward real logs; not production-ready)
+
+By default (`INGEST_MODE=legacy`) HEALTHTRACE reads the three synthetic files the generator writes, with raw
+identifiers. That mode is for demos and tests only and the dashboard warns about it. To read other
+structured JSON-lines logs, use configured mode, which pseudonymizes identifiers and omits free text:
+
+1. Generate a secret outside the repository and keep it in your environment or secret store (never commit it):
+   `python -c "import secrets; print(secrets.token_hex(32))"`.
+2. Set `INGEST_MODE=configured` and `PSEUDONYM_KEY=<that value>` (see `.env.example`). The server refuses to
+   start without a valid key; it never falls back to raw identifiers.
+3. Declare each source under `ingest.sources` in `config.yaml` (commented example included): the file path
+   (inside `LOG_DIR` or `INGEST_ALLOWED_DIRS`), its `kind` (`app`/`audit`/`auth`), the field mapping, value
+   mapping and, for offset-less timestamps, the source `timezone`. Unknown services and unmappable lines are
+   rejected with a reason code, not guessed.
+4. Duplicates are dropped by source event id (`INGEST_DEDUPE=event_id`, default). Content-hash de-duplication is opt-in.
+5. Check `GET /api/ingest/status` (per-source state and reject counts, no line content) and
+   `GET /api/security/status`.
+
+Details: [Ingestion](docs/ingestion.md), [Event schema](docs/event-schema.md). Known limits include a 60-second
+crash replay window, memory-only detector state, POSIX-only rotation draining and residual privacy risks listed
+there. Run only against authorized, read-only copies of logs, and complete a security review first.
+
 ## Dashboard
 
 Overview, Incidents (grouped, with severity, risk score, status, pin),
@@ -163,6 +185,9 @@ cd frontend && npm run typecheck && npm run lint && npm run build
 - [AWS deployment](docs/aws-deployment.md)
 - [AWS IAM, laptop setup and live check](docs/aws-iam.md)
 - [Free deployment](docs/deployment.md)
+- [Ingestion](docs/ingestion.md) and [event schema](docs/event-schema.md)
+- [Privacy boundary](docs/privacy-boundary.md) and [M2 verification](docs/M2_PRIVACY_VERIFICATION.md)
+- [Dataset provenance](docs/DATASET_PROVENANCE.md)
 - [Hospital-readiness foundations](docs/hospital-readiness.md)
 - [Adding AWS later](docs/aws-later.md)
 - [Development](docs/development.md)

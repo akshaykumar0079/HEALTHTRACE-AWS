@@ -30,6 +30,7 @@ from typing import Any, Optional, Union
 
 from app.api.ws import Broadcaster
 from app.config import AppConfig, Settings
+from app.privacy.safe_log import safe_exc
 from app.detect.access import AccessDetector
 from app.detect.auth import AuthDetector, score_auth_anomaly
 from app.detect.anomaly import AnomalyEngine
@@ -38,11 +39,15 @@ from app.detect.severity import score_hipaa_anomaly, score_service_anomaly
 from app.detect.window import SlidingWindow
 from app.incidents.engine import IncidentEngine, IncidentUpdate, fingerprint_for
 from app.incidents.view import incident_view
-from app.ingest.tailer import Tailer
+from app.ingest.tailer import SourceLine, Tailer
 from app.models import Alert, Anomaly, AppEvent, AuditEvent, AuthEvent, WindowMetrics
 from app.notify.aws import AwsNotifier
 from app.notify.mailer import EmailNotifier, EmailSettings
 from app.parse.enricher import Enricher
+from app.ingest.dedupe import Deduper
+from app.ingest.pseudonym import IngestConfigError, Pseudonymizer
+from app.ingest.registry import SourceRegistry
+from app.ingest.quarantine import Quarantine
 from app.parse.parser import Parser
 from app.privacy.redaction import Redactor
 from app.privacy.retention import RetentionPolicy, apply_retention
@@ -115,6 +120,18 @@ class Pipeline:
 
         self.queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=10000)
         self.parser = Parser()
+        self.quarantine = Quarantine()
+        if settings.ingest_mode not in ("legacy", "configured"):
+            raise IngestConfigError("INGEST_MODE must be 'legacy' or 'configured'")
+        # Configured mode needs a valid secret and refuses to start without one:
+        # there is deliberately no fallback to raw identifiers.
+        self.pseudonymizer: Optional[Pseudonymizer] = None
+        self.key_state: dict[str, Any] = {"fingerprint": None, "legacy_rows_at_cutover": None, "rotated_at": None}
+        if settings.ingest_mode == "configured":
+            self.pseudonymizer = Pseudonymizer.from_setting(settings.pseudonym_key.get_secret_value())
+        self.deduper = Deduper(settings.ingest_dedupe, key=self.pseudonymizer.key if self.pseudonymizer else None)
+        self.registry: Optional[SourceRegistry] = None
+        self._adapters: dict[str, Any] = {}
         self.enricher = Enricher(config)
         self.window = SlidingWindow(config.window.size_seconds, config.window.step_seconds)
         self.baseline = BaselineEngine(config.baseline)
@@ -142,6 +159,12 @@ class Pipeline:
         )
         self.notifier.redact = self.redactor.redact_value
         self.email.redact = self.redactor.redact_value
+        if self.pseudonymizer is not None:
+            self.registry = SourceRegistry(
+                config, settings, pseudonymizer=self.pseudonymizer,
+                redact_text=self.redactor.redact_text, legacy_parser=self.parser,
+            )
+            self._adapters = self.registry.adapters()
         self.broadcaster = Broadcaster()
         self.db_errors = 0
         self.last_db_error: Optional[str] = None
@@ -169,6 +192,8 @@ class Pipeline:
         self._event_clock: Optional[datetime] = None
         self._last_hipaa_sweep: Optional[datetime] = None
         self._tailers: list[Tailer] = []
+        self._tailer_tasks: dict[Tailer, asyncio.Task] = {}
+        self.tailer_restarts = 0
         self._tasks: list[asyncio.Task] = []
         self._consumer_task: Optional[asyncio.Task] = None
 
@@ -177,7 +202,17 @@ class Pipeline:
     async def start(self) -> None:
         self.started_at = datetime.now(timezone.utc)
         await self.store.connect()
+        try:
+            await self._check_pseudonym_key()
+        except IngestConfigError:
+            await self.store.close()
+            raise
         await self.baseline.load(self.store)
+        try:
+            await self.quarantine.load(self.store)
+            await self.deduper.load(self.store)
+        except Exception as exc:  # bookkeeping must never stop start-up
+            self._db_failed("load ingest state", exc)
         await self._restore_incidents()
         await self.notifier.start()
         await self._load_notification_prefs()
@@ -191,26 +226,101 @@ class Pipeline:
         # the end rather than learning the same history twice.
         first_run = not positions and self.baseline.is_empty()
         self._tailers = []
-        for name in ("app.log", "audit.log", "auth.log"):
-            path = self.settings.log_dir / name
-            saved = positions.get(str(path))
-            self._tailers.append(
-                Tailer(
-                    path, self.queue, from_start=first_run,
-                    resume_file_id=saved[0] if saved else None,
-                    resume_offset=saved[1] if saved else None,
-                )
+        if self.registry is not None:
+            for sid, src in self.registry.sources.items():
+                saved = positions.get(str(src.path))
+                self._tailers.append(self._make_tailer(src.path, sid, first_run or src.cfg.from_start, saved,
+                                                       stalled_after=src.cfg.stalled_after_seconds))
+        else:
+            logger.warning(
+                "INGEST_MODE=legacy: the three synthetic files are read with the project's own schemas and "
+                "raw identifiers. Legacy mode is for demos and tests only and is NOT suitable for real logs; "
+                "use INGEST_MODE=configured (see docs/ingestion.md)."
             )
+            for name in ("app.log", "audit.log", "auth.log"):
+                path = self.settings.log_dir / name
+                self._tailers.append(self._make_tailer(path, name, first_run, positions.get(str(path))))
         self._init_replay_tracking()
 
         for tailer in self._tailers:
-            self._tasks.append(asyncio.create_task(tailer.run()))
+            self._start_tailer_task(tailer)
         self._consumer_task = asyncio.create_task(self._consume())
         self._tasks.append(asyncio.create_task(self._periodic_save()))
         self._tasks.append(asyncio.create_task(self._heartbeat()))
         if self.settings.retention_interval_hours > 0:
             self._tasks.append(asyncio.create_task(self._retention_loop()))
         self._tasks.append(asyncio.create_task(self._tick()))
+
+    async def _check_pseudonym_key(self) -> None:
+        """Notice a changed pseudonymization key instead of silently re-labelling every actor.
+
+        Only a one-way fingerprint of the key is stored (never the key). On first use of
+        configured mode we also record whether the database already held incident or alert
+        rows: those were written before pseudonymization and may contain raw identifiers."""
+        self.key_state = {"fingerprint": None, "legacy_rows_at_cutover": None, "rotated_at": None}
+        if self.pseudonymizer is None:
+            return
+        current = self.pseudonymizer.fingerprint()
+        try:
+            stored = await self.store.get_ingest_meta("pseudonym_key_fingerprint")
+            if stored is None:
+                row = await (await self.store.conn.execute(
+                    "SELECT (SELECT COUNT(*) FROM incidents) + (SELECT COUNT(*) FROM alerts)")).fetchone()
+                legacy = bool(row and row[0])
+                await self.store.set_ingest_meta("pseudonym_key_fingerprint", current)
+                await self.store.set_ingest_meta("legacy_rows_at_cutover", "1" if legacy else "0")
+                if legacy:
+                    logger.warning(
+                        "configured ingestion was enabled on a database that already holds incidents/alerts; "
+                        "those rows predate pseudonymization and may contain raw identifiers "
+                        "(see docs/privacy-boundary.md, historical data)")
+            elif stored != current:
+                if not self.settings.pseudonym_key_rotation_ack:
+                    raise IngestConfigError(
+                        "PSEUDONYM_KEY differs from the key this database was used with. Every pseudonym would "
+                        "change, so incidents for the same person would stop correlating. To rotate on purpose, set "
+                        "PSEUDONYM_KEY_ROTATION_ACK=true for one start (see docs/privacy-boundary.md); otherwise "
+                        "restore the previous key or use a new database.")
+                logger.warning("PSEUDONYM_KEY changed (acknowledged): pseudonyms from now on differ from earlier ones")
+                await self.store.set_ingest_meta("pseudonym_key_fingerprint", current)
+                await self.store.set_ingest_meta("key_rotated_at", datetime.now(timezone.utc).isoformat())
+            self.key_state = {
+                "fingerprint": current[:8],
+                "legacy_rows_at_cutover": (await self.store.get_ingest_meta("legacy_rows_at_cutover")) == "1",
+                "rotated_at": await self.store.get_ingest_meta("key_rotated_at"),
+            }
+        except IngestConfigError:
+            raise
+        except Exception as exc:  # bookkeeping failure must not stop monitoring, but must be visible
+            self._db_failed("check pseudonym key fingerprint", exc)
+
+    def _make_tailer(self, path: Path, source: str, from_start: bool, saved, *, stalled_after: Optional[float] = None) -> Tailer:
+        return Tailer(
+            path, self.queue, from_start=from_start,
+            resume_file_id=saved[0] if saved else None,
+            resume_offset=saved[1] if saved else None,
+            max_line_bytes=self.settings.ingest_max_line_bytes,
+            source=source,
+            stalled_after=stalled_after,
+            on_reject=lambda reason, offset, length, _src=source: self.quarantine.record(_src, reason, offset, length),
+        )
+
+    def _start_tailer_task(self, tailer: Tailer) -> None:
+        task = asyncio.create_task(tailer.run())
+        self._tailer_tasks[tailer] = task
+        self._tasks.append(task)
+
+    def _supervise_tailers(self) -> None:
+        """``Tailer.run`` retries I/O errors itself; this catches anything that
+        still ends a tailer task (a bug, an unexpected exception) and restarts it,
+        so one source cannot silently stop being read."""
+        for tailer, task in list(self._tailer_tasks.items()):
+            if not task.done() or tailer._stopped:  # noqa: SLF001
+                continue
+            reason = "cancelled" if task.cancelled() else type(task.exception()).__name__ if task.exception() else "returned"
+            self.tailer_restarts += 1
+            logger.error("pipeline: tailer %s ended (%s); restarting", tailer.path.name, reason)
+            self._start_tailer_task(tailer)
 
     async def stop(self) -> None:
         for tailer in self._tailers:
@@ -223,6 +333,7 @@ class Pipeline:
             except asyncio.CancelledError:
                 pass
         self._tasks = []
+        self._tailer_tasks = {}
         # Everything the tailers read must be processed before offsets are
         # saved, or those lines would be skipped on the next start.
         drained = True
@@ -239,6 +350,8 @@ class Pipeline:
                 pass
             self._consumer_task = None
         await self._save_state(save_positions=drained)
+        for tailer in self._tailers:
+            tailer.close()
         await self.notifier.stop()
         await self.email.stop()
         await self.store.close()
@@ -275,7 +388,7 @@ class Pipeline:
         WebSocket and notifiers must keep running when the database hiccups."""
         self.db_errors += 1
         self.last_db_error = f"{what}: {type(exc).__name__}"
-        logger.error("pipeline: database error during %s (%s): %s", what, type(exc).__name__, str(exc)[:200])
+        logger.error("pipeline: database error during %s (%s)", what, safe_exc(exc))
 
     async def audit(self, actor: str, action: str, target_type: str, target_id: object = None,
                     detail: Optional[str] = None, outcome: str = "ok") -> None:
@@ -314,6 +427,11 @@ class Pipeline:
 
     async def _save_state(self, *, save_positions: bool = True) -> None:
         await self.baseline.save(self.store)
+        try:
+            await self.quarantine.flush(self.store)
+            await self.deduper.flush(self.store)
+        except Exception as exc:
+            self._db_failed("save ingest state", exc)
         if save_positions:
             for tailer in self._tailers:
                 if tailer.file_id is not None:
@@ -358,6 +476,7 @@ class Pipeline:
         """Once a second: throughput sample, batched log stream, replay progress."""
         while True:
             await asyncio.sleep(TICK_SECONDS)
+            self._supervise_tailers()
             self._sample_throughput()
             if self.replay_active:
                 if all(t.caught_up for t in self._tailers) and self.queue._unfinished_tasks == 0:  # noqa: SLF001
@@ -393,18 +512,35 @@ class Pipeline:
 
     async def _consume(self) -> None:
         while True:
-            line = await self.queue.get()
+            item = await self.queue.get()
             try:
-                await self._process_line(line)
-            except Exception:
-                logger.exception("pipeline: error processing line")
+                if isinstance(item, SourceLine):
+                    await self._process_line(item.line, item.source, item.offset)
+                else:
+                    await self._process_line(item)
+            except Exception as exc:  # the line and the exception text are deliberately not logged
+                logger.error("pipeline: error processing a line: %s", safe_exc(exc))
             finally:
                 self.queue.task_done()
 
-    async def _process_line(self, line: str) -> None:
-        event = self.parser.parse_line(line)
-        if event is None:
-            return
+    async def _process_line(self, line: str, source: str = "legacy", offset: Optional[int] = None) -> None:
+        adapter = self._adapters.get(source)
+        if adapter is not None:
+            # Configured source: explicit mapping, UTC, pseudonyms, event-id dedupe.
+            result = adapter.parse(line)
+            event, reason, event_id = result.event, result.reason, result.event_id
+            if event is None:
+                self.quarantine.record(source, reason or "schema_invalid", offset, len(line))
+                return
+            if self.deduper.is_duplicate(source, event_id, line):
+                return
+        else:
+            if self.deduper.mode == "content" and self.deduper.is_duplicate(source, None, line):
+                return
+            event, reason = self.parser.parse(line)
+            if event is None:
+                self.quarantine.record(source, reason or "schema_invalid", offset, len(line))
+                return
         self._remember_log(event)
         if isinstance(event, AppEvent):
             self.events_processed["app"] += 1
@@ -610,8 +746,8 @@ class Pipeline:
             if alert.kind == "latency_degradation":
                 out.sort(key=lambda r: r.get("latency_ms", 0), reverse=True)
             return out[: self.EVIDENCE_PER_ALERT]
-        except Exception:  # evidence is best-effort
-            logger.exception("pipeline: evidence selection failed")
+        except Exception as exc:  # evidence is best-effort
+            logger.error("pipeline: evidence selection failed: %s", safe_exc(exc))
             return []
 
     async def _capture_evidence(self, incident, alert: Alert) -> None:
@@ -723,9 +859,17 @@ class Pipeline:
             "throughput_history": recent[-60:],
             "replay": self.replay_status(),
             "tailers": [
-                {"path": t.path.name, "offset": t.committed_offset, "size": t.file_size, "caught_up": t.caught_up}
+                {"path": t.path.name, "offset": t.committed_offset, "size": t.file_size, "caught_up": t.caught_up,
+                 "state": t.state}
                 for t in self._tailers
             ],
+            "tailer_restarts": self.tailer_restarts,
+            "ingest": {
+                "mode": self.settings.ingest_mode,
+                "rejects": self.quarantine.by_reason(),
+                "dedupe": self.deduper.stats(),
+                "naive_timestamps_assumed_utc": self.parser.naive_assumed_utc,
+            },
         }
 
     def services_snapshot(self) -> list[dict[str, Any]]:
