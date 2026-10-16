@@ -35,6 +35,10 @@ class ServiceConfig(BaseModel):
 class BaselineConfig(BaseModel):
     alpha: float
     warmup_windows: int
+    # False judges every window against the service's all-hours baseline and
+    # ignores the per-hour-of-day bucket. Only the evaluation ablation turns
+    # this off (docs/evaluation.md); the product default is time-aware.
+    time_aware: bool = True
 
 
 class AnomalyConfig(BaseModel):
@@ -267,6 +271,7 @@ class Settings(BaseSettings):
     retention_notification_attempts_days: int = 30
     retention_simulation_runs_days: int = 30
     retention_audit_days: int = 365
+    retention_research_days: int = 30    # uploaded research datasets + experiment records (files); 0 = keep forever
     retention_interval_hours: int = 24   # background cleanup cadence; 0 = manual only
     # Role tokens, all sent as X-Operator-Token. viewer: read; operator
     # (OPERATOR_TOKEN): acknowledge/resolve/pin/run simulations; admin
@@ -309,6 +314,12 @@ class Settings(BaseSettings):
     # Absolute by default so behavior doesn't depend on the process's cwd;
     # .env overrides these with its own (also ideally absolute) paths.
     log_dir: Path = REPO_ROOT / "data" / "logs"
+    # -- user-provided dataset evaluation (docs/user-datasets.md) --------------
+    research_enabled: bool = True
+    research_dir: Optional[Path] = None   # default: <folder of DB_PATH>/research
+    research_max_upload_mb: int = 25
+    research_max_rows: int = 200_000
+    research_max_columns: int = 100
     db_path: Path = REPO_ROOT / "data" / "medguard.db"
     control_file: Path = REPO_ROOT / "data" / "control.json"
 

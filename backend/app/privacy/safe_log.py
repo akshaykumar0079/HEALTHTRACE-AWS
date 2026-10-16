@@ -68,7 +68,8 @@ def safe_exc(exc: BaseException) -> str:
         frames = traceback.extract_tb(tb)
         if frames:
             last = frames[-1]
-            where = f" at {last.filename.rsplit('/', 1)[-1]}:{last.lineno} in {last.name}"
+            base = last.filename.replace("\\", "/").rsplit("/", 1)[-1]
+            where = f" at {base}:{last.lineno} in {last.name}"
     return f"{type(exc).__name__}{where}"
 
 

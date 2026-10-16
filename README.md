@@ -131,6 +131,17 @@ Details: [Ingestion](docs/ingestion.md), [Event schema](docs/event-schema.md). K
 crash replay window, memory-only detector state, POSIX-only rotation draining and residual privacy risks listed
 there. Run only against authorized, read-only copies of logs, and complete a security review first.
 
+## Evaluation (research prototype, synthetic data)
+
+`cd backend && python -m app.evaluation` runs every simulator scenario over 10 fixed seeds for the
+detector, a fixed-threshold baseline and two ablations, and writes `results.json`, CSV files and a
+`summary.md` to `data/evaluation/`. Metric definitions, method, output format and limitations are in
+[docs/evaluation.md](docs/evaluation.md). Results are synthetic and in-sample; they do not show real-world accuracy.
+
+The dashboard page **Your data** runs the detector on your own CSV/JSON Lines file (preview, column mapping, validation,
+optional ground-truth labels, saved and repeatable experiments); see [docs/user-datasets.md](docs/user-datasets.md). Use synthetic or
+de-identified data only: this is a research prototype, not HIPAA-certified.
+
 ## Dashboard
 
 Overview, Incidents (grouped, with severity, risk score, status, pin),
@@ -175,6 +186,8 @@ cd frontend && npm run typecheck && npm run lint && npm run build
 
 - [Incident grouping and Time Machine](docs/incident-grouping.md)
 - [Simulator](docs/simulator.md)
+- [Evaluation: reproducible experiments, baselines, ablations](docs/evaluation.md)
+- [Evaluate your own dataset (upload, map, validate, run)](docs/user-datasets.md)
 - [Correlation](docs/correlation.md)
 - [Privacy, retention, roles](docs/privacy-and-retention.md)
 - [Architecture](docs/architecture.md)

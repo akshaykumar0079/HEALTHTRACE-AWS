@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from app.api.research import router as research_router
 from app.api.routes import router as api_router
 from app.api.ws import router as ws_router
 from app.config import AppConfig, Settings, get_settings, load_config
@@ -119,6 +120,7 @@ def create_app(settings: Optional[Settings] = None, config: Optional[AppConfig] 
         return response
 
     app.include_router(api_router, prefix="/api")
+    app.include_router(research_router, prefix="/api")
     app.include_router(ws_router)
     _mount_frontend(app, settings.static_dir)
     return app

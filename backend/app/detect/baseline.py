@@ -57,7 +57,7 @@ class BaselineEngine:
         """The ready baseline for (service, hour_of_day, metric), falling back
         to the global per-service baseline if the hourly bucket hasn't warmed
         up yet, or None if neither has (SPEC.md 6.4: "emit no anomalies")."""
-        hourly = self._cells.get((service, hour_of_day, metric))
+        hourly = self._cells.get((service, hour_of_day, metric)) if self._config.time_aware else None
         if hourly is not None and hourly.count >= self._config.warmup_windows:
             return BaselineStats(hourly.mean, hourly.variance, hourly.count, is_global_fallback=False)
 

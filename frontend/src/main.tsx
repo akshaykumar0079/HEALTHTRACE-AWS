@@ -25,6 +25,7 @@ const ServiceDetail = lazy(() => import("./pages/ServiceDetail"));
 const Aws = lazy(() => import("./pages/Aws"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Simulator = lazy(() => import("./pages/Simulator"));
+const Research = lazy(() => import("./pages/Research"));
 
 function LegacyIncidentRedirect() {
   const { id } = useParams();
@@ -62,6 +63,7 @@ const router = createBrowserRouter([
       { path: "services/:name", element: <ServiceDetail /> },
       { path: "aws", element: <Aws /> },
       { path: "simulator", element: <Simulator /> },
+      { path: "research", element: <Research /> },
       { path: "settings", element: <Settings /> },
     ],
   },
