@@ -12,6 +12,7 @@ import {
   PushPin,
   SquaresFour,
   Terminal,
+  UploadSimple,
   Warning,
   type Icon,
 } from "@phosphor-icons/react";
@@ -33,6 +34,7 @@ export const NAV: NavItem[] = [
   { to: "/app/history", label: "History", icon: Clock, group: "main", keywords: "resolved closed past" },
   { to: "/app/settings", label: "Settings", icon: GearSix, group: "main", keywords: "notifications email detection config token" },
   { to: "/app/simulator", label: "Simulator", icon: Flask, group: "tools", keywords: "synthetic scenarios test detection false positives benchmark" },
+  { to: "/app/research", label: "Your data", icon: UploadSimple, group: "tools", keywords: "upload csv jsonl dataset evaluate precision recall labels experiment" },
   { to: "/app/monitor", label: "Monitoring", icon: Pulse, group: "tools", keywords: "live monitor error rate chart" },
   { to: "/app/alerts", label: "Alerts", icon: BellRinging, group: "tools", keywords: "alert feed rules" },
   { to: "/app/logs", label: "Log explorer", icon: Terminal, group: "tools", keywords: "search events" },

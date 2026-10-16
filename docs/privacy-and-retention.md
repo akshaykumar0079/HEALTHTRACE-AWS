@@ -38,6 +38,7 @@ simulate) are written to the audit log (`GET /api/audit`).
 | Resolved incidents | 90 d | resolved and **unpinned** only |
 | Notification attempts | 30 d | age |
 | Simulation runs | 30 d | age |
+| Research uploads and experiments (files, [user-datasets.md](user-datasets.md)) | 30 d | age; an upload still used by a newer experiment is kept |
 | Audit log | 365 d | age |
 
 `0` keeps forever. Open incidents are never deleted. Background cleanup every

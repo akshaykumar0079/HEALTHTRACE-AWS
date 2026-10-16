@@ -1,4 +1,4 @@
-.PHONY: gen backfill backend frontend build test demo deploy
+.PHONY: gen backfill backend frontend build test eval demo deploy
 
 # Continuous normal traffic, polling data/control.json for demo injections.
 # Run as a module (not `python generator/generate.py`) so its `from
@@ -21,6 +21,10 @@ build:
 
 test:
 	python -m pytest backend/tests -q
+
+# Detector vs baseline vs ablations over 10 seeds -> data/evaluation (docs/evaluation.md).
+eval:
+	cd backend && python -m app.evaluation --workers 3
 
 # Backfill + generator + backend + UI in containers, on http://localhost:8080.
 demo:

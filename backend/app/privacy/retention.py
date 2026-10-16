@@ -33,6 +33,7 @@ class RetentionPolicy:
     notification_attempts_days: int = 30
     simulation_runs_days: int = 30
     audit_days: int = 365
+    research_days: int = 0     # the dataclass default is 'off'; Settings supplies 30 (RETENTION_RESEARCH_DAYS)
 
     @classmethod
     def from_settings(cls, settings: Any) -> "RetentionPolicy":
@@ -44,6 +45,7 @@ class RetentionPolicy:
             notification_attempts_days=max(0, int(settings.retention_notification_attempts_days)),
             simulation_runs_days=max(0, int(settings.retention_simulation_runs_days)),
             audit_days=max(0, int(settings.retention_audit_days)),
+            research_days=max(0, int(getattr(settings, "retention_research_days", 30))),
         )
 
     @property
@@ -63,6 +65,9 @@ class RetentionPolicy:
             row("Notification attempts", self.notification_attempts_days, "days", "Deleted when older than the limit."),
             row("Simulation runs", self.simulation_runs_days, "days", "Deleted when older than the limit."),
             row("Audit log", self.audit_days, "days", "Longest by default; do not shorten without a policy decision."),
+            row("Research uploads and experiments", self.research_days, "days",
+                "Uploaded datasets and saved experiment records (files, not database rows). An upload still "
+                "referenced by a newer experiment is kept until that experiment expires."),
         ]
 
 

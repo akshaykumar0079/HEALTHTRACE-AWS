@@ -157,6 +157,9 @@ class Pipeline:
             extra_fields=settings.redact_extra_fields.split(","),
             extra_patterns=settings.redact_extra_patterns.split(","),
         )
+        from app.research.service import ResearchService  # late: it reaches back into the pipeline via the simulator
+
+        self.research = ResearchService(settings, config, self.redactor)
         self.notifier.redact = self.redactor.redact_value
         self.email.redact = self.redactor.redact_value
         if self.pseudonymizer is not None:
@@ -450,6 +453,8 @@ class Pipeline:
         started = datetime.now(timezone.utc)
         try:
             deleted = await apply_retention(self.store, self.retention, now=started, dry_run=dry_run)
+            deleted.update(await asyncio.to_thread(self.research.store.purge, self.retention.research_days,
+                                                   now=started, dry_run=dry_run))
             outcome = {"ran_at": started.isoformat(), "dry_run": dry_run, "deleted": deleted, "error": None}
         except Exception as exc:
             self._db_failed("retention cleanup", exc)

@@ -25,3 +25,7 @@ Base path `/api`. Endpoints marked *operator* require `X-Operator-Token` when
 | POST | `/aws/test-alert` | Send one labelled test message per channel (*operator*) |
 | GET | `/demo/scenarios` | Scenario catalogue |
 | POST | `/demo/inject` | `{scenario, duration_s}` when `DEMO_MODE=true` (*operator*) |
+
+## User-provided datasets
+
+Under `/api/research` (upload, preview, validate, run, repeat, compare): see [user-datasets.md](user-datasets.md#api).

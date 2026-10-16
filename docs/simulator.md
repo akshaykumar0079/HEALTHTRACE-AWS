@@ -33,3 +33,7 @@ UI: **Simulator** page in the dashboard.
 These are synthetic results, not a claim about real-world accuracy. The control
 false positive and the mild-degradation misses are real weaknesses of the
 current thresholds.
+
+The seed-33 control false positive is a LOW `batch` error-rate incident caused by 5 errors in one
+100-event window passing all three guards at once; the analysis, a regression test and a larger
+10-seed comparison with a threshold baseline and ablations are in [evaluation.md](evaluation.md).

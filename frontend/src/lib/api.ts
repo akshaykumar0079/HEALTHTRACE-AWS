@@ -32,6 +32,14 @@ import type {
   ServiceDetail,
   ServiceRow,
   WindowMetrics,
+  ResearchComparison,
+  ResearchExperiment,
+  ResearchExperimentRow,
+  ResearchInfo,
+  ResearchInspection,
+  ResearchMapping,
+  ResearchReport,
+  ResearchUploadResult,
 } from "./types";
 
 const TOKEN_KEY = "healthtrace.operatorToken";
@@ -79,6 +87,37 @@ export class ApiError extends Error {
   }
 }
 
+async function failure(response: Response): Promise<ApiError> {
+  let detail = response.statusText;
+  try {
+    const body = (await response.json()) as { detail?: unknown };
+    if (typeof body.detail === "string") detail = body.detail;
+    else if (Array.isArray(body.detail)) detail = "The request was rejected as invalid.";
+    else if (body.detail && typeof body.detail === "object" && "message" in body.detail) {
+      const d = body.detail as { message: string; missing?: string[] };
+      detail = d.missing?.length ? `${d.message} (missing: ${d.missing.join(", ")})` : d.message;
+    }
+  } catch {
+    /* non-JSON error body */
+  }
+  return new ApiError(response.status, detail);
+}
+
+/** Upload a dataset file as the raw request body (no multipart). Only called after the privacy warning is acknowledged. */
+async function uploadFile(path: string, file: File): Promise<ResearchUploadResult> {
+  const headers = new Headers({ "Content-Type": "application/octet-stream", "X-Filename": encodeURIComponent(file.name), "X-Privacy-Ack": "yes" });
+  const token = getOperatorToken();
+  if (token) headers.set("X-Operator-Token", token);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api${path}`, { method: "POST", headers, body: file });
+  } catch {
+    throw new ApiError(0, "The HEALTHTRACE backend is unreachable.");
+  }
+  if (!response.ok) throw await failure(response);
+  return (await response.json()) as ResearchUploadResult;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body) headers.set("Content-Type", "application/json");
@@ -91,21 +130,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     throw new ApiError(0, "The HEALTHTRACE backend is unreachable.");
   }
-  if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: unknown };
-      if (typeof body.detail === "string") detail = body.detail;
-      else if (Array.isArray(body.detail)) detail = "The request was rejected as invalid.";
-      else if (body.detail && typeof body.detail === "object" && "message" in body.detail) {
-        const d = body.detail as { message: string; missing?: string[] };
-        detail = d.missing?.length ? `${d.message} (missing: ${d.missing.join(", ")})` : d.message;
-      }
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new ApiError(response.status, detail);
-  }
+  if (!response.ok) throw await failure(response);
   return (await response.json()) as T;
 }
 
@@ -171,6 +196,18 @@ export const api = {
     request<SimResult & { id: number }>("/simulations/run", { method: "POST", body: JSON.stringify({ scenario_id, seed }) }),
   runBenchmark: (seeds: number[]) =>
     request<BenchmarkResult>("/simulations/benchmark", { method: "POST", body: JSON.stringify({ seeds }) }),
+  researchInfo: () => request<ResearchInfo>("/research/info"),
+  researchUpload: (file: File) => uploadFile("/research/uploads", file),
+  researchInspect: (id: string) => request<{ inspection: ResearchInspection }>(`/research/uploads/${id}`),
+  researchValidate: (id: string, mapping: ResearchMapping) =>
+    request<ResearchReport>(`/research/uploads/${id}/validate`, { method: "POST", body: JSON.stringify({ mapping }) }),
+  researchRun: (body: { upload_id: string; mapping: ResearchMapping; methods: string[]; mode: string }) =>
+    request<ResearchExperiment>("/research/experiments", { method: "POST", body: JSON.stringify({ ...body, acknowledged_privacy_warning: true }) }),
+  researchExperiments: () => request<{ items: ResearchExperimentRow[] }>("/research/experiments"),
+  researchExperiment: (id: string) => request<ResearchExperiment>(`/research/experiments/${id}`),
+  researchRerun: (id: string) => request<ResearchExperiment>(`/research/experiments/${id}/rerun`, { method: "POST" }),
+  researchCompare: (a: string, b: string) => request<ResearchComparison>(`/research/experiments/compare${qs({ a, b })}`),
+  researchDeleteUpload: (id: string) => request<{ deleted: boolean }>(`/research/uploads/${id}`, { method: "DELETE" }),
   scenarios: () => request<{ enabled: boolean; scenarios: DemoScenario[] }>("/demo/scenarios"),
   inject: (scenario: string, duration_s: number) =>
     request<{ scenario: string; duration_s: number }>("/demo/inject", {

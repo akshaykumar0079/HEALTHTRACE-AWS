@@ -772,3 +772,5 @@ export interface CorrelationResult {
   limits?: string;
   synthetic?: boolean;
 }
+
+export * from "./researchTypes";

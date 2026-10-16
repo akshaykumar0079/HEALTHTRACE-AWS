@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from app.config import REPO_ROOT, Settings, load_config
+from app.config import REPO_ROOT, AppConfig, Settings, load_config
 from app.incidents.view import evidence_quality
 from app.pipeline import Pipeline
 from app.simulation.scenarios import (
@@ -40,6 +40,16 @@ def _generator():
     return gen
 
 
+def stream_labels(scn: SimScenario) -> dict[str, str]:
+    """The labelled injection interval; identical for every seed."""
+    t0 = SIM_START
+    inject_start = t0 + timedelta(seconds=WARMUP_SECONDS)
+    inject_end = inject_start + timedelta(seconds=scn.inject_seconds)
+    end = inject_end + timedelta(seconds=TAIL_SECONDS)
+    return {"start": t0.isoformat(), "inject_start": inject_start.isoformat(),
+            "inject_end": inject_end.isoformat(), "end": end.isoformat()}
+
+
 def build_stream(scn: SimScenario, seed: int) -> tuple[list[str], dict[str, str]]:
     """Deterministic synthetic log lines (all three logs merged by timestamp)
     plus the labelled injection interval."""
@@ -48,7 +58,6 @@ def build_stream(scn: SimScenario, seed: int) -> tuple[list[str], dict[str, str]
     t0 = SIM_START
     inject_start = t0 + timedelta(seconds=WARMUP_SECONDS)
     inject_end = inject_start + timedelta(seconds=scn.inject_seconds)
-    end = inject_end + timedelta(seconds=TAIL_SECONDS)
 
     events: list[dict] = []
     for name, start, duration in (
@@ -59,11 +68,7 @@ def build_stream(scn: SimScenario, seed: int) -> tuple[list[str], dict[str, str]
         app, audit, auth = gen.generate_events(name, duration, scn.rate, start, rng)
         events += app + audit + auth
     events.sort(key=lambda e: e["ts"])
-    labels = {
-        "start": t0.isoformat(), "inject_start": inject_start.isoformat(),
-        "inject_end": inject_end.isoformat(), "end": end.isoformat(),
-    }
-    return [json.dumps(e) for e in events], labels
+    return [json.dumps(e) for e in events], stream_labels(scn)
 
 
 def _isolated_settings(workdir: Path) -> Settings:
@@ -87,12 +92,26 @@ def _entity(incident) -> str:
     return incident.service or incident.user_id or ""
 
 
-async def run_scenario_async(scenario_id: str, seed: Optional[int] = None) -> dict[str, Any]:
+async def run_scenario_async(
+    scenario_id: str, seed: Optional[int] = None, *,
+    config: Optional[AppConfig] = None, collect: Optional[dict[str, Any]] = None,
+    lines: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Run one scenario through the real pipeline.
+
+    ``config`` overrides config.yaml (used by the evaluation ablations; the
+    caller must pass a copy, never the cached shared object). ``collect``, when
+    given, is filled with the raw ``incidents`` and ``alerts`` so the evaluation
+    can score them on its own terms. ``lines`` lets a caller reuse an already
+    built stream for the same (scenario, seed). None of these change the default
+    behaviour or the result dict.
+    """
     scn = SCENARIOS.get(scenario_id)
     if scn is None:
         raise KeyError(scenario_id)
     seed = scn.seed if seed is None else int(seed)
-    lines, labels = build_stream(scn, seed)
+    built, labels = build_stream(scn, seed) if lines is None else (lines, stream_labels(scn))
+    lines = built
     inject_start = datetime.fromisoformat(labels["inject_start"])
     inject_end = datetime.fromisoformat(labels["inject_end"])
     sim_end = datetime.fromisoformat(labels["end"])
@@ -100,7 +119,7 @@ async def run_scenario_async(scenario_id: str, seed: Optional[int] = None) -> di
     with tempfile.TemporaryDirectory(prefix="healthtrace-sim-") as tmp:
         workdir = Path(tmp)
         (workdir / "logs").mkdir()
-        pipeline = Pipeline(_isolated_settings(workdir), load_config())
+        pipeline = Pipeline(_isolated_settings(workdir), config or load_config())
         decisions: list[dict[str, Any]] = []
         original_record = pipeline.incidents.record_alert
 
@@ -128,6 +147,8 @@ async def run_scenario_async(scenario_id: str, seed: Optional[int] = None) -> di
         finally:
             await pipeline.store.close()
 
+    if collect is not None:
+        collect["incidents"], collect["alerts"], collect["labels"] = incidents, alerts, labels
     alerts_by_incident: dict[int, list] = {}
     for a in alerts:
         alerts_by_incident.setdefault(a.incident_id or -1, []).append(a)
@@ -218,9 +239,9 @@ async def run_scenario_async(scenario_id: str, seed: Optional[int] = None) -> di
     }
 
 
-def run_scenario(scenario_id: str, seed: Optional[int] = None) -> dict[str, Any]:
+def run_scenario(scenario_id: str, seed: Optional[int] = None, **kwargs: Any) -> dict[str, Any]:
     """Synchronous entry point; runs in its own event loop (use from a thread when already inside one)."""
-    return asyncio.run(run_scenario_async(scenario_id, seed))
+    return asyncio.run(run_scenario_async(scenario_id, seed, **kwargs))
 
 
 async def run_scenario_threaded(scenario_id: str, seed: Optional[int] = None) -> dict[str, Any]:
