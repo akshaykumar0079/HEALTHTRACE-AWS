@@ -51,6 +51,7 @@ keeps raw synthetic identifiers and is unsuitable for sensitive real-world data.
 | `ingest_seen` | de-duplication window | keyed digests only |
 | `ingest_rejects`, `ingest_reject_counts` | source, reason code, offset, length | **never the line** |
 | `ingest_meta` | key fingerprint, cutover flags | non-secret facts only |
+| `ai_insights` | validated incident insight JSON (summary, hypotheses, evidence ids) | no: built from an allow-listed bundle with `actor-N` aliases, never raw ids or free text ([ai-incident-intelligence.md](ai-incident-intelligence.md)) |
 | `schema_migrations` | applied migration versions | no |
 
 ### Other outputs

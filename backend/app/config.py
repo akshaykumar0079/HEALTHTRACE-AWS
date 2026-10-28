@@ -301,6 +301,18 @@ class Settings(BaseSettings):
     # Every pseudonym changes with the key, so old and new incidents for the same person no
     # longer correlate; without this flag a changed key stops start-up (docs/privacy-boundary.md).
     pseudonym_key_rotation_ack: bool = False
+    # -- AI incident intelligence (Phase 1). Everything is off by default. The deterministic
+    # insight needs none of this; a local Ollama model is an optional extra
+    # (docs/ai-incident-intelligence.md).
+    ai_enabled: bool = False
+    ai_provider: Literal["none", "ollama"] = "none"
+    ai_ollama_url: str = "http://127.0.0.1:11434"   # loopback only; any other host is refused
+    ai_model: str = ""
+    ai_timeout_seconds: float = 30.0
+    ai_max_prompt_chars: int = 12000
+    ai_max_response_chars: int = 8000
+    # Incident intelligence (related / duplicate suggestions). Matching on the same pseudonymous actor is opt-in.
+    incident_intel_match_actor: bool = False
     # Built frontend to serve at "/", if present.
     static_dir: Path = REPO_ROOT / "frontend" / "dist"
 

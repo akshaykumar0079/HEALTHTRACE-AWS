@@ -42,6 +42,7 @@ TEXT_COLUMNS: dict[str, list[str]] = {
     "audit_log": ["target_id", "detail"],
     "notification_attempts": ["detail"],
     "simulation_runs": ["summary", "result_json"],
+    "ai_insights": ["payload_json"],
 }
 TEXT_PATTERNS: dict[str, re.Pattern[str]] = {
     "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),

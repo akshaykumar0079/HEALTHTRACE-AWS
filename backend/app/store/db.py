@@ -414,6 +414,89 @@ class Store:
         rows = await (await self.conn.execute(query, params)).fetchall()
         return [_row_to_incident(r) for r in rows]
 
+    # -- incident intelligence (read-only aggregates; no schema change) ---------------
+
+    async def incidents_overlapping(
+        self, start: datetime, end: datetime, *, exclude_id: Optional[int] = None, limit: int = 300
+    ) -> list[Incident]:
+        """Incidents whose activity window [opened, resolved|last seen] touches [start, end]. Bounded by ``limit``."""
+        sql = (f"SELECT {_INCIDENT_COLS} FROM incidents WHERE opened_at <= ? "
+               "AND COALESCE(resolved_at, last_seen_at, opened_at) >= ?")
+        params: list[object] = [end.isoformat(), start.isoformat()]
+        if exclude_id is not None:
+            sql += " AND id <> ?"
+            params.append(exclude_id)
+        sql += " ORDER BY opened_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = await (await self.conn.execute(sql, params)).fetchall()
+        return [_row_to_incident(r) for r in rows]
+
+    async def evidence_shapes(self, incident_ids: list[int]) -> dict[int, frozenset]:
+        """{incident id: {(log source, level)}} from stored evidence. Only these two coarse labels leave the
+        database: never the message, record or any identifier."""
+        if not incident_ids:
+            return {}
+        marks = ",".join("?" for _ in incident_ids)
+        rows = await (await self.conn.execute(
+            f"SELECT incident_id, source, COALESCE(level, '') FROM evidence_events WHERE incident_id IN ({marks}) "
+            "GROUP BY incident_id, source, level", list(incident_ids))).fetchall()
+        out: dict[int, set] = {}
+        for iid, source, level in rows:
+            out.setdefault(int(iid), set()).add((source, level))
+        return {k: frozenset(v) for k, v in out.items()}
+
+    @staticmethod
+    def _trend_where(since: datetime, until: datetime, service: Optional[str], kind: Optional[str],
+                     severity: Optional[str]) -> tuple[str, list[object]]:
+        clauses = ["opened_at >= ?", "opened_at < ?"]
+        params: list[object] = [since.isoformat(), until.isoformat()]
+        for column, value in (("service", service), ("kind", kind), ("peak_severity", severity)):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        return " WHERE " + " AND ".join(clauses), params
+
+    async def incident_trends(
+        self, *, since: datetime, until: datetime, bucket: str = "day", service: Optional[str] = None,
+        kind: Optional[str] = None, severity: Optional[str] = None, recurring_limit: int = 10,
+        resolution_sample_limit: int = 5000,
+    ) -> dict[str, Any]:
+        """Aggregates over incidents opened in [since, until). All grouping happens in SQL; only the resolution
+        durations (capped) come back as rows so a median can be computed portably on SQLite and PostgreSQL.
+        Timestamps are stored as UTC ISO text, so ``substr`` buckets by UTC day/hour."""
+        where, params = self._trend_where(since, until, service, kind, severity)
+        width = 13 if bucket == "hour" else 10
+
+        async def rows(sql: str, extra: Optional[list[object]] = None) -> list[Any]:
+            return list(await (await self.conn.execute(sql, params + (extra or []))).fetchall())
+
+        series = await rows(f"SELECT substr(opened_at, 1, {width}) AS b, peak_severity, COUNT(*) FROM incidents{where} "
+                            "GROUP BY b, peak_severity ORDER BY b")
+        by_severity = await rows(f"SELECT peak_severity, COUNT(*) FROM incidents{where} GROUP BY peak_severity")
+        by_service = await rows(f"SELECT COALESCE(service, ''), COUNT(*) FROM incidents{where} GROUP BY service "
+                                "ORDER BY COUNT(*) DESC, service")
+        by_kind = await rows(f"SELECT kind, COUNT(*) FROM incidents{where} GROUP BY kind ORDER BY COUNT(*) DESC, kind")
+        by_state = await rows(f"SELECT state, COUNT(*) FROM incidents{where} GROUP BY state")
+        recurring = await rows(
+            "SELECT kind, COALESCE(service, ''), COUNT(*), MIN(opened_at), MAX(opened_at), COALESCE(SUM(reopen_count), 0) "
+            f"FROM incidents{where} GROUP BY kind, service HAVING COUNT(*) >= 2 "
+            "ORDER BY COUNT(*) DESC, kind, service LIMIT ?", [recurring_limit])
+        resolved_total = await rows(f"SELECT COUNT(*) FROM incidents{where} AND state = 'RESOLVED'")
+        durations = await rows(
+            f"SELECT mttr_seconds FROM incidents{where} AND state = 'RESOLVED' AND mttr_seconds IS NOT NULL "
+            "AND mttr_seconds >= 0 AND resolved_at IS NOT NULL AND resolved_at >= opened_at "
+            "ORDER BY id DESC LIMIT ?", [resolution_sample_limit])
+        return {
+            "series": [(r[0], r[1], int(r[2])) for r in series],
+            "by_severity": [(r[0], int(r[1])) for r in by_severity],
+            "by_service": [(r[0] or None, int(r[1])) for r in by_service],
+            "by_kind": [(r[0], int(r[1])) for r in by_kind],
+            "by_state": [(r[0], int(r[1])) for r in by_state],
+            "recurring": [(r[0], r[1] or None, int(r[2]), r[3], r[4], int(r[5] or 0)) for r in recurring],
+            "resolved_total": int(resolved_total[0][0]) if resolved_total else 0,
+            "durations": [float(r[0]) for r in durations],
+        }
+
     # -- evidence (bounded log events that explain an incident) -----------------
 
     async def save_evidence(
@@ -462,6 +545,30 @@ class Store:
             "SELECT id, alert_id, ts, record_json FROM evidence_events WHERE incident_id = ? "
             "ORDER BY ts DESC, id DESC LIMIT ?", (incident_id, limit))).fetchall()
         return [{"id": r[0], "alert_id": r[1], "ts": r[2], "record": json.loads(r[3])} for r in rows]
+
+    # -- AI incident insights (m006): validated, sanitised JSON only ----------------------
+
+    async def save_ai_insight(self, insight: Any, *, keep_per_incident: int = 3) -> int:
+        new_id = await self.conn.insert(
+            "INSERT INTO ai_insights (incident_id, bundle_hash, created_at, generated_by, model, prompt_version, "
+            "status, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (insight.incident_id, insight.bundle_hash, insight.generated_at, insight.generated_by, insight.model,
+             insight.prompt_version, insight.status, insight.model_dump_json()),
+        )
+        await self.conn.execute(
+            "DELETE FROM ai_insights WHERE incident_id = ? AND id NOT IN ("
+            "SELECT id FROM (SELECT id FROM ai_insights WHERE incident_id = ? ORDER BY id DESC LIMIT ?) AS keep)",
+            (insight.incident_id, insight.incident_id, keep_per_incident))
+        await self.conn.commit()
+        return new_id
+
+    async def latest_ai_insight(self, incident_id: int) -> Optional[Any]:
+        from app.ai.schema import Insight  # local import: the store must not depend on the AI package at import time
+
+        row = await (await self.conn.execute(
+            "SELECT payload_json FROM ai_insights WHERE incident_id = ? ORDER BY id DESC LIMIT 1",
+            (incident_id,))).fetchone()
+        return Insight.model_validate_json(row[0]) if row else None
 
     # -- ingestion bookkeeping (m004): metadata only, never raw lines -------------------
 

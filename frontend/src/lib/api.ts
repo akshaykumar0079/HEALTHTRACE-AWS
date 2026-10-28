@@ -13,6 +13,10 @@ import type {
   HipaaUser,
   Incident,
   IncidentDetail,
+  InsightResponse,
+  RelatedResponse,
+  DuplicatesResponse,
+  IncidentTrends,
   IncidentSearchParams,
   IncidentSearchResult,
   IncidentSummary,
@@ -186,6 +190,13 @@ export const api = {
     request<TimelineResponse>(`/incidents/${id}/timeline${qs(p)}`),
   timelineEntry: (id: number, entryId: string) =>
     request<TimelineEntryDetail>(`/incidents/${id}/timeline/${encodeURIComponent(entryId).replace(/%3A/g, ":")}`),
+  insight: (id: number) => request<InsightResponse>(`/incidents/${id}/insight`),
+  generateInsight: (id: number) =>
+    request<InsightResponse>(`/incidents/${id}/insight/generate`, { method: "POST" }),
+  related: (id: number, limit = 10) => request<RelatedResponse>(`/incidents/${id}/related${qs({ limit })}`),
+  duplicates: (id: number) => request<DuplicatesResponse>(`/incidents/${id}/duplicates`),
+  incidentTrends: (p: { days?: number; service?: string; kind?: string; severity?: string } = {}) =>
+    request<IncidentTrends>(`/incidents/trends${qs(p)}`),
   reopen: (id: number) => request<Incident>(`/incidents/${id}/reopen`, { method: "POST" }),
   correlation: (id: number, windowMinutes = 15) =>
     request<CorrelationResult>(`/incidents/${id}/correlation${qs({ window_minutes: windowMinutes })}`),

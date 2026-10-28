@@ -21,6 +21,8 @@ from app.demo import MAX_DURATION_S, MIN_DURATION_S, SCENARIO_NAMES, SCENARIOS
 from app.incidents.timeline import (
     TimelineQuery, build_timeline, entry_detail, load_timeline_data, ALL_SOURCES,
 )
+from app.ai.service import InsightService, TooSoon
+from app.incidents import related as intel
 from app.incidents.explain import detection_rule
 from app.incidents.view import KIND_TITLE, STATUS_LABEL, incident_view
 from app.models import Incident, IncidentEvent
@@ -270,6 +272,51 @@ async def recent_activity(request: Request, limit: int = Query(default=15, ge=1,
     return rows
 
 
+# -- incident intelligence (read-only; see docs/incident-intelligence.md) -------------
+
+
+def _as_utc(value: datetime) -> datetime:
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+# Declared before ``/incidents/{incident_id}`` so "trends" is not parsed as an id.
+@router.get("/incidents/trends")
+async def incident_trends(
+    request: Request,
+    since: Optional[datetime] = Query(default=None, description="start of range (UTC if no offset); default until - days"),
+    until: Optional[datetime] = Query(default=None, description="end of range, exclusive; default now"),
+    days: int = Query(default=30, ge=1, le=366, description="range length when `since` is not given"),
+    bucket: Literal["auto", "day", "hour"] = "auto",
+    service: Optional[str] = None,
+    kind: Optional[str] = None,
+    severity: Optional[str] = None,
+) -> dict[str, Any]:
+    """Counts of stored incidents opened in a range: over time, by severity/service/type, open vs resolved,
+    recurring patterns and (only with enough valid timestamps) time to resolution."""
+    pipeline = _pipeline(request)
+    end = _as_utc(until) if until else (_metrics_anchor(pipeline) or datetime.now(timezone.utc))
+    start = _as_utc(since) if since else end - timedelta(days=days)
+    if start >= end:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
+    if end - start > timedelta(days=366):
+        raise HTTPException(status_code=422, detail="range may not exceed 366 days")
+    if bucket == "auto":
+        bucket = "hour" if end - start <= timedelta(days=3) else "day"
+    elif bucket == "hour" and end - start > timedelta(days=7):
+        raise HTTPException(status_code=422, detail="hourly buckets need a range of 7 days or less")
+    if service is not None and service not in pipeline.config.services:
+        raise HTTPException(status_code=422, detail=f"unknown service: {service}")
+    if kind is not None and kind not in KIND_TITLE:
+        raise HTTPException(status_code=422, detail=f"kind must be one of {sorted(KIND_TITLE)}")
+    if severity is not None and severity not in _SEVERITIES:
+        raise HTTPException(status_code=422, detail=f"severity must be one of {sorted(_SEVERITIES)}")
+    raw = await pipeline.store.incident_trends(
+        since=start, until=end, bucket=bucket, service=service, kind=kind, severity=severity)
+    out = intel.build_trends(raw, since=start, until=end, bucket=bucket)
+    out["filters"] = {"service": service, "kind": kind, "severity": severity}
+    return out
+
+
 @router.get("/incidents/{incident_id}")
 async def incident_detail(incident_id: int, request: Request) -> dict[str, Any]:
     pipeline = _pipeline(request)
@@ -286,6 +333,56 @@ async def incident_detail(incident_id: int, request: Request) -> dict[str, Any]:
         "evidence": evidence,
         "detection": detection_rule(pipeline.config, incident.kind),
     }
+
+
+def _insights(request: Request) -> InsightService:
+    """The AI insight service, created on first use so the rest of the app is untouched when it is never called."""
+    service = getattr(request.app.state, "ai_insights", None)
+    if service is None:
+        p = _pipeline(request)
+        service = InsightService(p.settings, p.config, p.store, p.redactor)
+        request.app.state.ai_insights = service
+    return service
+
+
+async def _load_incident(request: Request, incident_id: int) -> Incident:
+    pipeline = _pipeline(request)
+    incident = pipeline.incidents.get(incident_id) or await pipeline.store.get_incident(incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+    return incident
+
+
+@router.get("/ai/status")
+async def ai_status(request: Request) -> dict[str, Any]:
+    """Whether a local model is configured. The deterministic insight is always available."""
+    return _insights(request).status()
+
+
+@router.get("/incidents/{incident_id}/insight")
+async def incident_insight(incident_id: int, request: Request) -> dict[str, Any]:
+    """Summary, severity rationale, hypotheses and next steps, each citing evidence ids. Recommendations only."""
+    incident = await _load_incident(request, incident_id)
+    out = await _insights(request).current(incident)
+    return {"insight": out["insight"].model_dump(mode="json"), "stale_ai_available": out["stale_ai_available"],
+            "ai": out["ai"]}
+
+
+@router.post("/incidents/{incident_id}/insight/generate")
+async def generate_incident_insight(incident_id: int, request: Request,
+                                    actor: str = Depends(require_operator)) -> dict[str, Any]:
+    """Ask the configured local model (if any) and validate its answer; otherwise the deterministic insight."""
+    pipeline = _pipeline(request)
+    incident = await _load_incident(request, incident_id)
+    service = _insights(request)
+    try:
+        insight = await service.generate(incident)
+    except TooSoon:
+        raise HTTPException(status_code=429, detail="an insight was requested for this incident a moment ago")
+    await pipeline.audit(actor, "ai_insight", "incident", incident_id,
+                         detail=f"{insight.generated_by}:{insight.fallback_reason or 'ok'}",
+                         outcome="ok" if insight.status == "ok" else "fallback")
+    return {"insight": insight.model_dump(mode="json"), "stale_ai_available": False, "ai": service.status()}
 
 
 async def _lifecycle(request: Request, incident_id: int, actor: str, action: str, apply, not_found: str) -> dict[str, Any]:
@@ -866,6 +963,70 @@ async def _incident_or_404(pipeline: Pipeline, incident_id: int) -> Incident:
     if incident is None:
         raise HTTPException(status_code=404, detail="incident not found")
     return incident
+
+
+def _service_graph(pipeline: Pipeline) -> dict[str, list[str]]:
+    return {name: list(cfg.depends_on) for name, cfg in pipeline.config.services.items()}
+
+
+@router.get("/incidents/{incident_id}/related")
+async def related_incidents(
+    incident_id: int, request: Request,
+    limit: int = Query(default=10, ge=1, le=25),
+    min_score: float = Query(default=intel.MIN_RELATED_SCORE, ge=0.0, le=1.0),
+    window_hours: float = Query(default=6.0, ge=0.25, le=72.0, description="how far around the incident to look"),
+) -> dict[str, Any]:
+    """Incidents that may be related to this one, each with a score and the reasons for it. Read-only: nothing is
+    linked, merged or changed, and a match is a lead, not proof of a shared cause."""
+    pipeline = _pipeline(request)
+    source = await _incident_or_404(pipeline, incident_id)
+    match_actor = bool(pipeline.settings.incident_intel_match_actor)
+    matches, considered, truncated = await intel.find_related(
+        pipeline.store, source, graph=_service_graph(pipeline), match_actor=match_actor, limit=limit,
+        min_score=min_score, window_hours=window_hours)
+    return {
+        "source_incident_id": source.id,
+        "related": [intel.related_view(source.id, m) for m in matches],
+        "count": len(matches),
+        "candidates_considered": considered,
+        "candidates_truncated": truncated,
+        "criteria": {"min_score": min_score, "window_hours": window_hours, "actor_matching": match_actor},
+        "disclaimer": intel.DISCLAIMER,
+    }
+
+
+@router.get("/incidents/{incident_id}/duplicates")
+async def duplicate_incidents(
+    incident_id: int, request: Request,
+    limit: int = Query(default=5, ge=1, le=10),
+    max_gap_minutes: float = Query(default=30.0, ge=0.0, le=240.0),
+) -> dict[str, Any]:
+    """Conservative duplicate suggestions (same type, same service, nearly the same time). For human review only:
+    nothing is merged, resolved or deleted."""
+    pipeline = _pipeline(request)
+    source = await _incident_or_404(pipeline, incident_id)
+    match_actor = bool(pipeline.settings.incident_intel_match_actor)
+    skipped: Optional[str] = None
+    duplicates: list[dict[str, Any]] = []
+    if source.kind in intel.ACTOR_SCOPED and not match_actor:
+        skipped = ("This anomaly type is grouped per person. Duplicate suggestions would need to compare the actor, "
+                   "which is disabled (INCIDENT_INTEL_MATCH_ACTOR), so none are made.")
+    elif not source.service:
+        skipped = "The incident has no service, so there is nothing safe to compare."
+    else:
+        start, end = intel.candidate_window(source, hours=max_gap_minutes / 60.0)
+        candidates = await pipeline.store.incidents_overlapping(start, end, exclude_id=source.id)
+        found = intel.rank_duplicates(source, candidates, limit=limit, match_actor=match_actor,
+                                      max_gap_seconds=max_gap_minutes * 60.0)
+        duplicates = [intel.duplicate_view(source.id, m) for m in found]
+    return {
+        "source_incident_id": source.id,
+        "duplicates": duplicates,
+        "count": len(duplicates),
+        "skipped_reason": skipped,
+        "criteria": {"max_gap_minutes": max_gap_minutes, "actor_matching": match_actor},
+        "disclaimer": intel.DUPLICATE_DISCLAIMER,
+    }
 
 
 @router.get("/incidents/{incident_id}/timeline")

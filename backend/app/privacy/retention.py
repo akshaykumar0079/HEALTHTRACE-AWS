@@ -123,10 +123,20 @@ async def apply_retention(
         n = await _scalar(store, f"SELECT COUNT(*) FROM ({purge_sql}) AS t", purge_params)
         result["resolved_incidents"] = n
         if n and not dry_run:
-            for table in ("incident_events", "evidence_events", "alerts"):
+            for table in ("incident_events", "evidence_events", "alerts", "ai_insights"):
                 await store.conn.execute(f"DELETE FROM {table} WHERE incident_id IN ({purge_sql})", purge_params)
             await store.conn.execute(f"DELETE FROM incidents WHERE id IN ({purge_sql})", purge_params)
             await store.conn.commit()
+    if policy.evidence_days:
+        # AI insights are derived from evidence, so they follow the evidence rule (and are regenerable).
+        p = (_cut(now, days=policy.evidence_days),)
+        cond = "created_at < ?"
+        n = await _scalar(store, f"SELECT COUNT(*) FROM ai_insights WHERE {cond}", p)
+        if n:
+            result["ai_insights"] = n
+            if not dry_run:
+                await store.conn.execute(f"DELETE FROM ai_insights WHERE {cond}", p)
+                await store.conn.commit()
     if policy.notification_attempts_days:
         p = (_cut(now, days=policy.notification_attempts_days),)
         await run("notification_attempts", "SELECT COUNT(*) FROM notification_attempts WHERE ts < ?",

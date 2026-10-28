@@ -302,12 +302,36 @@ class Migration:
     apply: Callable[[Database], Awaitable[None]]
 
 
+async def _m006_ai_insights(db: Database) -> None:
+    """Stored AI/template incident insights (docs/ai-incident-intelligence.md). Additive only: a
+    new table holding the sanitised, validated insight JSON, never raw logs or identifiers. Only
+    validated local-model insights are stored; the deterministic one is computed on demand."""
+    pk, big = db.pk, db.bigint
+    await db.run_script(
+        f"""
+        CREATE TABLE IF NOT EXISTS ai_insights (
+            id {pk},
+            incident_id {big} NOT NULL,
+            bundle_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            generated_by TEXT NOT NULL,
+            model TEXT,
+            prompt_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_insights_incident ON ai_insights(incident_id, created_at)
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "baseline_schema", _m001_baseline_schema),
     Migration(2, "incident_workflow", _m002_incident_workflow),
     Migration(3, "time_machine", _m003_time_machine),
     Migration(4, "ingest_hardening", _m004_ingest_hardening),
     Migration(5, "ingest_meta", _m005_ingest_meta),
+    Migration(6, "ai_insights", _m006_ai_insights),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1].version

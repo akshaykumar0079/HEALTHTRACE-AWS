@@ -5,6 +5,7 @@ import type { Severity } from "@/lib/types";
 import { KIND_LABEL, SEVERITIES, SEVERITY_HEX, compact, duration, num, pct, serviceLabel } from "@/lib/format";
 import { EmptyState, ErrorState, PageHeader, Panel, PanelHeader, Segmented, Skeleton } from "@/components/ui";
 import { StackedColumns, TimeSeries } from "@/components/charts";
+import { IncidentTrends } from "@/components/IncidentTrends";
 
 const RANGES = [
   { value: "6", label: "6h" },
@@ -225,6 +226,7 @@ export default function Analytics() {
           </div>
         </Panel>
       </div>
+      <IncidentTrends />
       <p className="text-[11.5px] text-fg-dim">
         Window metrics are retained for 24 hours; alert and anomaly history is kept in SQLite.
       </p>

@@ -774,3 +774,146 @@ export interface CorrelationResult {
 }
 
 export * from "./researchTypes";
+
+// -- AI incident intelligence (Phase 1) ----------------------------------------------------------
+
+export interface InsightClaim {
+  text: string;
+  evidence_refs: string[];
+}
+
+export interface InsightHypothesis extends InsightClaim {
+  /** Always "hypothesis": set by the backend, never by a model. */
+  label: "hypothesis";
+  confidence: "low" | "medium" | "high";
+}
+
+export interface InsightEvidenceRef {
+  id: string;
+  type: string;
+  label: string;
+}
+
+export interface IncidentInsight {
+  incident_id: number;
+  generated_at: string;
+  generated_by: "deterministic" | "ollama";
+  model: string | null;
+  status: "ok" | "fallback";
+  fallback_reason: string | null;
+  dropped_claims: number;
+  summary: InsightClaim;
+  severity_rationale: InsightClaim;
+  hypotheses: InsightHypothesis[];
+  next_steps: InsightClaim[];
+  overall_confidence: "low" | "medium" | "high";
+  evidence_quality: string;
+  insufficient_evidence: boolean;
+  evidence: InsightEvidenceRef[];
+  /** Recommendations only: this is always empty in Phase 1. */
+  executed_actions: string[];
+  disclaimer: string;
+}
+
+export interface AiStatus {
+  enabled: boolean;
+  provider: string;
+  model_configured: boolean;
+  deterministic_fallback: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface InsightResponse {
+  insight: IncidentInsight;
+  stale_ai_available: boolean;
+  ai: AiStatus;
+}
+
+// -- incident intelligence (Phase 2): rule-based, read-only suggestions ------------------------------------
+
+export interface IncidentRef {
+  id: number;
+  title: string;
+  kind: AnomalyKind;
+  service: string | null;
+  state: IncidentState;
+  status_label: string;
+  severity: Severity;
+  alert_count: number;
+  opened_at: string | null;
+  last_seen_at: string | null;
+  resolved_at: string | null;
+}
+
+export interface RelatedIncident {
+  source_incident_id: number;
+  related_incident_id: number;
+  score: number;
+  reasons: string[];
+  signals: string[];
+  time_gap_seconds: number | null;
+  incident: IncidentRef;
+  basis: "deterministic_match";
+}
+
+export interface RelatedResponse {
+  source_incident_id: number;
+  related: RelatedIncident[];
+  count: number;
+  candidates_considered: number;
+  candidates_truncated: boolean;
+  criteria: { min_score: number; window_hours: number; actor_matching: boolean };
+  disclaimer: string;
+}
+
+export interface DuplicateSuggestion {
+  source_incident_id: number;
+  candidate_incident_id: number;
+  confidence: "likely" | "possible";
+  score: number;
+  reasons: string[];
+  cautions: string[];
+  time_gap_seconds: number | null;
+  incident: IncidentRef;
+  requires_human_review: true;
+  basis: "deterministic_match";
+}
+
+export interface DuplicatesResponse {
+  source_incident_id: number;
+  duplicates: DuplicateSuggestion[];
+  count: number;
+  skipped_reason: string | null;
+  criteria: { max_gap_minutes: number; actor_matching: boolean };
+  disclaimer: string;
+}
+
+export interface IncidentTrends {
+  range: { since: string; until: string; bucket: "day" | "hour" };
+  total: number;
+  series: ({ bucket: string; total: number } & Record<Severity, number>)[];
+  by_severity: { key: Severity; count: number }[];
+  by_service: { key: string | null; label: string; count: number }[];
+  by_kind: { key: AnomalyKind; label: string; count: number }[];
+  status: { open: number; resolved: number; by_state: Record<string, number> };
+  recurring: {
+    kind: AnomalyKind;
+    label: string;
+    service: string | null;
+    count: number;
+    first_opened_at: string;
+    last_opened_at: string;
+    reopen_count: number;
+  }[];
+  resolution: {
+    available: boolean;
+    sample_size: number;
+    median_seconds: number | null;
+    p90_seconds: number | null;
+    max_seconds: number | null;
+    reason: string | null;
+  };
+  resolved_without_valid_duration: number;
+  filters: { service: string | null; kind: string | null; severity: string | null };
+  basis: string;
+}

@@ -42,6 +42,8 @@ import { TimeSeries, type TsPoint } from "@/components/charts";
 import { IncidentActions, LogLine } from "@/components/domain";
 import { EvidenceQualityChip, RiskScore, TrendChip } from "@/components/IncidentTable";
 import TelemetryCanvas from "@/three/TelemetryCanvas";
+import { AiInsight } from "@/components/AiInsight";
+import { DuplicateSuggestions, RelatedIncidents } from "@/components/RelatedIncidents";
 import { TimeMachine } from "@/components/TimeMachine";
 import { CorrelationPanel } from "@/components/CorrelationPanel";
 
@@ -489,6 +491,13 @@ export default function Investigation() {
           <Delivery detail={detail} />
         </motion.div>
       </div>
+
+      <motion.div {...fade(3)}><AiInsight incidentId={incidentId} /></motion.div>
+
+      <motion.div {...fade(3)} className="grid gap-5 lg:grid-cols-2">
+        <RelatedIncidents incidentId={incidentId} />
+        <DuplicateSuggestions incidentId={incidentId} />
+      </motion.div>
 
       <motion.div {...fade(4)}><TimeMachine incidentId={incidentId} state={inc.state} /></motion.div>
 
